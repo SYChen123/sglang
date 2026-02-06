@@ -14,7 +14,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs_func,
     move_accepted_tokens_to_target_kvcache,
 )
-from sglang.srt.speculative.ngram_info import NgramVerifyInput
+from sglang.srt.speculative.ngram_info import NgramVerifyInput, generate_tree_mask_func
 from sglang.srt.speculative.ngram_worker import USE_FULL_MASK, NGRAMWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import detect_nan, generate_token_bitmask
@@ -131,24 +131,38 @@ class NGRAMWorkerV2(NGRAMWorker):
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK:
-            tree_mask = []
-            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
-            for i in range(bs):
-                seq_len = batch.seq_lens_cpu[i]
-                req_mask = torch.ones((self.draft_token_num, seq_len)).to(
-                    device=self.device, non_blocking=True
-                )
-                req_mask = torch.cat(
-                    (
-                        req_mask,
-                        torch.from_numpy(mask[i]).to(
-                            device=self.device, non_blocking=True
-                        ),
-                    ),
-                    dim=1,
-                ).to(torch.bool)
-                tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(tree_mask, dim=0)
+            # tree_mask = []
+            # mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
+            # for i in range(bs):
+            #     seq_len = batch.seq_lens_cpu[i]
+            #     req_mask = torch.ones((self.draft_token_num, seq_len)).to(
+            #         device=self.device, non_blocking=True
+            #     )
+            #     req_mask = torch.cat(
+            #         (
+            #             req_mask,
+            #             torch.from_numpy(mask[i]).to(
+            #                 device=self.device, non_blocking=True
+            #             ),
+            #         ),
+            #         dim=1,
+            #     ).to(torch.bool)
+            #     tree_mask.append(req_mask.flatten())
+            # tree_mask = torch.cat(tree_mask, dim=0) # [draft_token_num * (sum(seq_len) + bs*draft_token_num)]
+
+            req_masks_size = batch.seq_lens_sum * self.draft_token_num
+            tree_mask_size = mask.size
+            req_masks = torch.ones((req_masks_size,), dtype=torch.bool).to(
+                device=self.device, non_blocking=True
+            )
+            output = torch.empty(
+                (req_masks_size + tree_mask_size,),
+                dtype=torch.bool,
+            ).to(device=self.device, non_blocking=True)
+            generate_tree_mask_func(
+                req_masks, tree_mask, batch, self.draft_token_num, output
+            )
+            tree_mask = output
 
         batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
         batch.forward_mode = ForwardMode.TARGET_VERIFY
