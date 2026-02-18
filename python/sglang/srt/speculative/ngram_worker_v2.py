@@ -248,9 +248,6 @@ class NGRAMWorkerV2(NGRAMWorker):
                 accept_index,
             ) = verify_input.sample(model_worker_batch, logits_output, vocab_mask)
             new_seq_lens = model_worker_batch.seq_lens + accept_length
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
-
             verified_tokens = predict[accept_index].flatten()
 
             # copy kvcache will not use the new_seq_lens
@@ -261,6 +258,9 @@ class NGRAMWorkerV2(NGRAMWorker):
                 self.token_to_kv_pool_allocator,
                 self.draft_token_num,
             )
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
+
             self._update_ngram_cache(model_worker_batch)
             model_worker_batch.forward_mode = ForwardMode.DECODE
 
@@ -273,7 +273,7 @@ class NGRAMWorkerV2(NGRAMWorker):
                 batch_result.next_token_ids,
                 batch_result.can_run_cuda_graph,
             )
-            new_seq_lens = model_worker_batch.seq_lens
+            new_seq_lens = model_worker_batch.seq_lens.clone()
 
             verified_tokens = torch.zeros(
                 bs, self.draft_token_num, dtype=torch.int32
