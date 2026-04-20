@@ -4,6 +4,8 @@ from copy import deepcopy
 from typing import Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -29,11 +31,106 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_compiler_backend, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+_is_npu = is_npu()
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def prepare_metadata(
+    max_ctx,
+    ctx_lens,
+    draft_seq_lens,
+    req_to_token,
+    req_pool_indices,
+    _block_pos_offsets_new,
+):
+    r = _block_pos_offsets_new[:max_ctx]
+    r = r[None, :]  # [1, max_ctx]
+    pos2d = draft_seq_lens.to(torch.int64)[:, None] + r  # [bs, max_ctx]
+    mask = r < ctx_lens[:, None]
+
+    # Batched gather of cache locations and positions.
+    cache2d = req_to_token[req_pool_indices[:, None], pos2d]  # [bs, max_ctx]
+    ctx_cache_loc = cache2d[mask].to(torch.int64)  # [sum(ctx_lens)]
+    ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
+    return ctx_cache_loc, ctx_positions
+
+
+@triton.jit
+def prepare_metadata_kernel(
+    max_ctx,
+    ctx_lens_ptr,
+    ctx_cumsum_ptr,
+    draft_seq_lens_ptr,
+    req_to_token,
+    req_pool_indices,
+    _block_pos_offsets_ptr,
+    ctx_cache_loc_ptr,
+    ctx_positions_ptr,
+    req_to_token_stride_x,
+    req_to_token_stride_y,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    ctx_cumsum = 0
+    if pid > 0:
+        ctx_cumsum = tl.load(ctx_cumsum_ptr + pid - 1).to(tl.int32)
+    offset = tl.arange(0, BLOCK_SIZE)
+    pos_offset = tl.load(_block_pos_offsets_ptr + offset)
+    draft_seq_lens = tl.load(draft_seq_lens_ptr + pid).to(tl.int64)
+    ctx_len = tl.load(ctx_lens_ptr + pid)
+
+    position = pos_offset + draft_seq_lens
+    mask = pos_offset < ctx_len
+
+    pool_idx = tl.load(req_pool_indices + pid)
+    cache_loc = tl.load(
+        req_to_token
+        + pool_idx * req_to_token_stride_x
+        + position * req_to_token_stride_y,
+        mask=mask,
+        other=0,
+    )
+
+    save_offset = ctx_cumsum + offset
+    tl.store(ctx_cache_loc_ptr + save_offset, cache_loc, mask=mask)
+    tl.store(ctx_positions_ptr + save_offset, position, mask=mask)
+
+
+def prepare_metadata_func(
+    max_ctx,
+    ctx_lens,
+    draft_seq_lens,
+    req_to_token,
+    req_pool_indices,
+    _block_pos_offsets_new,
+):
+    ctx_cumsum = torch.cumsum(ctx_lens, dim=0)
+    ctx_cache_loc = torch.empty(
+        ctx_cumsum[-1], dtype=torch.int64, device=ctx_lens.device
+    )
+    ctx_positions = torch.empty_like(ctx_cache_loc)
+    bs = ctx_lens.shape[0]
+    block_size = max_ctx
+    prepare_metadata_kernel[bs,](
+        max_ctx,
+        ctx_lens,
+        ctx_cumsum,
+        draft_seq_lens,
+        req_to_token,
+        req_pool_indices,
+        _block_pos_offsets_new,
+        ctx_cache_loc,
+        ctx_positions,
+        req_to_token.stride(0),
+        req_to_token.stride(1),
+        triton.next_power_of_2(block_size),
+    )
+    return ctx_cache_loc, ctx_positions
 
 
 def _get_fused_kv_materialize_helper():
@@ -177,6 +274,9 @@ class DFlashWorker:
 
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
+        )
+        self._block_pos_offsets_new = torch.arange(
+            saved_server_args.max_prefill_tokens, device=self.device, dtype=torch.int64
         )
         self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
         self._draft_block_positions_buf: Optional[torch.Tensor] = (
@@ -814,21 +914,17 @@ class DFlashWorker:
                 max_ctx = int(ctx_lens.max().item())
             else:
                 max_ctx = int(self.block_size)
-            if max_ctx <= 0:
+            if max_ctx <= 0 or max_ctx > self._block_pos_offsets_new.numel():
                 raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
 
-            if max_ctx <= self._block_pos_offsets.numel():
-                r = self._block_pos_offsets[:max_ctx]
-            else:
-                r = torch.arange(max_ctx, device=device, dtype=torch.int64)
-            r = r[None, :]  # [1, max_ctx]
-            pos2d = draft_seq_lens.to(torch.int64)[:, None] + r  # [bs, max_ctx]
-            mask = r < ctx_lens[:, None]
-
-            # Batched gather of cache locations and positions.
-            cache2d = req_to_token[req_pool_indices[:, None], pos2d]  # [bs, max_ctx]
-            ctx_cache_loc = cache2d[mask].to(torch.int64)  # [sum(ctx_lens)]
-            ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
+            ctx_cache_loc, ctx_positions = prepare_metadata_func(
+                max_ctx,
+                ctx_lens,
+                draft_seq_lens,
+                req_to_token,
+                req_pool_indices,
+                self._block_pos_offsets_new,
+            )
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(

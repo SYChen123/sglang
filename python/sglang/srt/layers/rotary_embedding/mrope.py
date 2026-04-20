@@ -19,7 +19,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_linear_ramp_mask,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_npu
+from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cuda, is_npu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -152,6 +152,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         ):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
+    @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
     def forward_native(
         self,
         positions: torch.Tensor,
