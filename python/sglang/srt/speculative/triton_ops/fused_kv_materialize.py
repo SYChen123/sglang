@@ -14,15 +14,28 @@
 """Fused Triton kernel for DFlash KV materialization.
 
 Combines: KV projection (cuBLAS) + RMSNorm + RoPE (Triton), then pool-managed KV writes.
+Set SGLANG_DFLASH_NORM_ROPE_TILELANG=1 to use the TileLang backend instead.
 """
 
+import os
 from typing import Callable, List
 
 import torch
 import triton
 import triton.language as tl
 
+# pip install apache-tvm-ffi==0.1.9
+# pip install tilelang==0.1.8
+_USE_TILELANG = os.environ.get("SGLANG_DFLASH_NORM_ROPE_TILELANG", "0") == "1"
 
+
+# @cached_triton_kernel(
+#     lambda args, kwargs: (args[0].dtype, args[1].dtype, args[14], args[15], args[16], args[18])
+#     # key = (kv_dtype, norm_weight_dtype, head_dim, kv_size, rotary_dim, eps)
+#     # - kv_dtype covers k_out/v_out (empty_like)
+#     # - positions is always int64, cos_sin_cache dtype is fixed per model
+#     # - half_rotary_dim = rotary_dim // 2, BLOCK_HD = next_power_of_2(head_dim): both derived
+# )
 @triton.jit
 def _fused_norm_rope_kernel(
     kv_ptr,  # [total_ctx, kv_size * 2]
@@ -31,13 +44,12 @@ def _fused_norm_rope_kernel(
     positions_ptr,  # [total_ctx]
     k_out_ptr,  # [total_ctx, num_kv_heads, head_dim]
     v_out_ptr,  # [total_ctx, num_kv_heads, head_dim]
-    kv_stride_ctx,
-    cos_sin_stride_pos,
-    k_out_stride_ctx,
-    k_out_stride_head,
-    v_out_stride_ctx,
-    v_out_stride_head,
-    total_ctx,
+    kv_stride_ctx: tl.constexpr,
+    cos_sin_stride_pos: tl.constexpr,
+    k_out_stride_ctx: tl.constexpr,
+    k_out_stride_head: tl.constexpr,
+    v_out_stride_ctx: tl.constexpr,
+    v_out_stride_head: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     kv_size: tl.constexpr,
@@ -49,8 +61,6 @@ def _fused_norm_rope_kernel(
     """Fused RMSNorm(K) + RoPE(K) materialization. Grid: (total_ctx, num_kv_heads)."""
     ctx_id = tl.program_id(0)
     head_id = tl.program_id(1)
-    if ctx_id >= total_ctx:
-        return
 
     # Load metadata
     position = tl.load(positions_ptr + ctx_id)
@@ -108,6 +118,156 @@ def _fused_norm_rope_kernel(
     tl.store(k_write + offs, k_normed.to(v_raw.dtype), mask=mask_pass)
 
 
+# ---------------------------------------------------------------------------
+# TileLang backend
+# ---------------------------------------------------------------------------
+
+
+def _make_fused_norm_rope_tilelang(
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    _tl_dtype: str,
+    _tl_norm_dtype: str,
+    eps: float,
+):
+    """Return a compiled TileLang kernel for the given shape/dtype config.
+
+    Uses T.symbolic() for total_ctx and max_pos with @T.prim_func (lazy mode)
+    and NO out_idx – outputs are passed as pre-allocated parameters by the
+    caller.  This avoids the ~200us per-launch overhead of out_idx which
+    internally allocates output tensors on every call.
+
+    Follows the act_quant_kernel pattern from the NSA tilelang kernels.
+    """
+    import tilelang
+    import tilelang.language as T
+
+    half_rotary_dim = rotary_dim // 2
+    BLOCK_HD = triton.next_power_of_2(head_dim)
+    kv_size = num_kv_heads * head_dim
+
+    # Symbolic dimensions – resolved at runtime from input shapes,
+    # no recompilation needed for different total_ctx values.
+    total_ctx_sym = T.symbolic("total_ctx")
+    max_pos_sym = T.symbolic("max_pos")
+
+    @tilelang.jit(target="cuda")
+    def _kernel_factory():
+        @T.prim_func
+        def main(
+            kv: T.Tensor[(total_ctx_sym, kv_size * 2), _tl_dtype],
+            k_norm_weight: T.Tensor[(head_dim,), _tl_norm_dtype],
+            cos_sin_cache: T.Tensor[(max_pos_sym, rotary_dim), "float32"],
+            positions: T.Tensor[(total_ctx_sym,), "int64"],
+            k_out: T.Tensor((total_ctx_sym, num_kv_heads, head_dim), _tl_dtype),
+            v_out: T.Tensor((total_ctx_sym, num_kv_heads, head_dim), _tl_dtype),
+        ):
+            # Grid: (total_ctx, num_kv_heads), BLOCK_HD threads per block
+            with T.Kernel(total_ctx_sym, num_kv_heads, threads=BLOCK_HD) as (
+                ctx_id,
+                head_id,
+            ):
+                # ── load K, V ────────────────────────────────────────────────
+                k_frag = T.alloc_fragment([BLOCK_HD], "float32")
+                v_frag = T.alloc_fragment([BLOCK_HD], _tl_dtype)
+                norm_w = T.alloc_fragment([BLOCK_HD], "float32")
+
+                for i in T.Parallel(BLOCK_HD):
+                    j = head_id * head_dim + i
+                    if i < head_dim:
+                        k_frag[i] = T.cast(kv[ctx_id, j], "float32")
+                        v_frag[i] = kv[ctx_id, kv_size + j]
+                        norm_w[i] = T.cast(k_norm_weight[i], "float32")
+                    else:
+                        k_frag[i] = T.float32(0.0)
+
+                # ── RMSNorm ──────────────────────────────────────────────────
+                k_sq = T.alloc_fragment([BLOCK_HD], "float32")
+                for i in T.Parallel(BLOCK_HD):
+                    k_sq[i] = k_frag[i] * k_frag[i]  # 0.0 for i >= head_dim
+
+                sq_sum = T.alloc_fragment([1], "float32")
+                T.reduce_sum(k_sq, sq_sum, dim=0, clear=True)
+
+                inv_rms = T.rsqrt(sq_sum[0] / T.float32(head_dim) + T.float32(eps))
+
+                k_normed = T.alloc_fragment([BLOCK_HD], "float32")
+                for i in T.Parallel(BLOCK_HD):
+                    k_normed[i] = k_frag[i] * inv_rms * norm_w[i]
+
+                # ── load cos/sin and second-half K ────────────────────────────
+                position = positions[ctx_id]
+                cos_frag = T.alloc_fragment([BLOCK_HD], "float32")
+                sin_frag = T.alloc_fragment([BLOCK_HD], "float32")
+                k_second = T.alloc_fragment([BLOCK_HD], "float32")
+
+                for i in T.Parallel(BLOCK_HD):
+                    if i < half_rotary_dim:
+                        cos_frag[i] = cos_sin_cache[position, i]
+                        sin_frag[i] = cos_sin_cache[position, half_rotary_dim + i]
+                        j2 = head_id * head_dim + half_rotary_dim + i
+                        k_second[i] = (
+                            T.cast(kv[ctx_id, j2], "float32")
+                            * inv_rms
+                            * T.cast(k_norm_weight[half_rotary_dim + i], "float32")
+                        )
+                    else:
+                        cos_frag[i] = T.float32(1.0)
+                        sin_frag[i] = T.float32(0.0)
+                        k_second[i] = T.float32(0.0)
+
+                # ── RoPE + write K ────────────────────────────────────────────
+                for i in T.Parallel(BLOCK_HD):
+                    if i < half_rotary_dim:
+                        k_out[ctx_id, head_id, i] = T.cast(
+                            k_normed[i] * cos_frag[i] - k_second[i] * sin_frag[i],
+                            _tl_dtype,
+                        )
+                        k_out[ctx_id, head_id, half_rotary_dim + i] = T.cast(
+                            k_second[i] * cos_frag[i] + k_normed[i] * sin_frag[i],
+                            _tl_dtype,
+                        )
+                    else:
+                        # pass-through region [rotary_dim, head_dim)
+                        if rotary_dim <= i and i < head_dim:
+                            k_out[ctx_id, head_id, i] = T.cast(k_normed[i], _tl_dtype)
+
+                # ── write V (no transform) ────────────────────────────────────
+                for i in T.Parallel(BLOCK_HD):
+                    if i < head_dim:
+                        v_out[ctx_id, head_id, i] = v_frag[i]
+
+        return main
+
+    return _kernel_factory()
+
+
+# Cache: (dtype, norm_dtype, num_kv_heads, head_dim, rotary_dim, eps) → compiled kernel
+# NOTE: total_ctx is NOT in the key – it is a T.symbolic() dimension,
+#       so one compiled kernel serves all batch sizes.
+_tilelang_kernel_cache: dict = {}
+
+
+def _get_tilelang_kernel(num_kv_heads, head_dim, rotary_dim, dtype, norm_dtype, eps):
+    key = (dtype, norm_dtype, num_kv_heads, head_dim, rotary_dim, eps)
+    if key not in _tilelang_kernel_cache:
+        _tl_dtype = {
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float32: "float32",
+        }[dtype]
+        _tl_norm_dtype = {
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float32: "float32",
+        }[norm_dtype]
+        _tilelang_kernel_cache[key] = _make_fused_norm_rope_tilelang(
+            num_kv_heads, head_dim, rotary_dim, _tl_dtype, _tl_norm_dtype, eps
+        )
+    return _tilelang_kernel_cache[key]
+
+
 def _fused_norm_rope(
     kv: torch.Tensor,  # [total_ctx, kv_size*2]
     k_norm_weight: torch.Tensor,  # [head_dim]
@@ -138,42 +298,56 @@ def _fused_norm_rope(
             f"rotary_dim={rotary_dim}, head_dim={head_dim}."
         )
 
-    half_rotary_dim = rotary_dim // 2
-    BLOCK_HD = triton.next_power_of_2(head_dim)
-
     # Ensure int64 for indexing
     if positions.device != kv.device:
         positions = positions.to(device=kv.device, dtype=torch.int64)
     elif positions.dtype != torch.int64:
         positions = positions.to(torch.int64)
 
-    k_out = torch.empty(
-        (total_ctx, num_kv_heads, head_dim), dtype=kv.dtype, device=kv.device
-    )
-    v_out = torch.empty_like(k_out)
+    if _USE_TILELANG:
+        kernel = _get_tilelang_kernel(
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            kv.dtype,
+            k_norm_weight.dtype,
+            eps,
+        )
+        # Pre-allocate outputs and pass as params (no out_idx)
+        k_out = torch.empty(
+            (total_ctx, num_kv_heads, head_dim), dtype=kv.dtype, device=kv.device
+        )
+        v_out = torch.empty_like(k_out)
+        kernel(kv, k_norm_weight, cos_sin_cache, positions, k_out, v_out)
+    else:
+        k_out = torch.empty(
+            (total_ctx, num_kv_heads, head_dim), dtype=kv.dtype, device=kv.device
+        )
+        v_out = torch.empty_like(k_out)
+        half_rotary_dim = rotary_dim // 2
+        BLOCK_HD = triton.next_power_of_2(head_dim)
+        _fused_norm_rope_kernel[(total_ctx, num_kv_heads)](
+            kv,
+            k_norm_weight,
+            cos_sin_cache,
+            positions,
+            k_out,
+            v_out,
+            kv.stride(0),
+            cos_sin_cache.stride(0),
+            k_out.stride(0),
+            k_out.stride(1),
+            v_out.stride(0),
+            v_out.stride(1),
+            num_kv_heads,
+            head_dim,
+            kv_size,
+            rotary_dim,
+            half_rotary_dim,
+            eps,
+            BLOCK_HD,
+        )
 
-    _fused_norm_rope_kernel[(total_ctx, num_kv_heads)](
-        kv,
-        k_norm_weight,
-        cos_sin_cache,
-        positions,
-        k_out,
-        v_out,
-        kv.stride(0),
-        cos_sin_cache.stride(0),
-        k_out.stride(0),
-        k_out.stride(1),
-        v_out.stride(0),
-        v_out.stride(1),
-        total_ctx,
-        num_kv_heads,
-        head_dim,
-        kv_size,
-        rotary_dim,
-        half_rotary_dim,
-        eps,
-        BLOCK_HD,
-    )
     return k_out, v_out
 
 
@@ -287,6 +461,11 @@ class FusedKVMaterializeHelper:
 
         # Batched KV projection: [n_layers, total_ctx, kv_size*2]
         kv_all = torch.einsum("th,loh->lto", ctx_hidden, self.batched_kv_weight)
+        if _USE_TILELANG and not kv_all.is_contiguous():
+            # TileLang kernels assume C-contiguous layout (no stride params).
+            # Ensure kv is contiguous – it may be a slice of the einsum output
+            # kv_all[layer_id] which can have non-standard strides.
+            kv_all = kv_all.contiguous()
 
         # Per-layer fused norm/RoPE/materialize, then delegate writes to the KV pool.
         for layer_id in range(self.n_layers):
