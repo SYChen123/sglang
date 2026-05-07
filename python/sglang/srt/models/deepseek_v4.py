@@ -82,7 +82,12 @@ MOE_BIT_WISE_EQUAL_MODE = False
 ATTN_BIT_WISE_EQUAL_MODE = False
 COMPRESSOR_BIT_WISE_EQUAL_MODE = False
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-
+_SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+_SGLANG_OPT_USE_TILELANG_MHC_PRE = envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+_SGLANG_OPT_DEEPGEMM_HC_PRENORM = envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+_SGLANG_OPT_USE_TILELANG_MHC_POST = envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+_SGLANG_DSV4_2604_SUBMODE = envs.SGLANG_DSV4_2604_SUBMODE.get()
+_SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
@@ -836,7 +841,7 @@ class MQALayer(nn.Module):
         freqs_cis = None
 
         enable_multi_stream = (
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            _SGLANG_OPT_USE_MULTI_STREAM_OVERLAP
             and self.alt_streams is not None
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
@@ -993,11 +998,13 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         @maybe_torch_compile
         def hc_pre_torch_impl(x, hc_fn):
-            x_flat = x.flatten(1).float()
+            x_flat = x.flatten(1).float()  # [bs*seqlen, hc_mult * hidden_size]
             rsqrt = torch.rsqrt(
                 x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
             )
-            mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
+            mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(
+                1
+            )  # [bs*seqlen, 1, 2*hc_mult + hc_mult^2], including H_pre, H_post, and H_res
             return x_flat, mixes
 
         shape, dtype = x.size(), x.dtype
@@ -1010,7 +1017,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if _SGLANG_OPT_USE_TILELANG_MHC_PRE:
             from sglang.srt.layers.mhc import mhc_pre
 
             post, comb, y = mhc_pre(
@@ -1026,7 +1033,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        if _SGLANG_OPT_DEEPGEMM_HC_PRENORM:
             import deep_gemm
 
             x_flat = x.flatten(1).bfloat16()
@@ -1052,7 +1059,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_mult,
             self.hc_sinkhorn_iters,
             self.hc_eps,
-        )
+        )  # [bs*s, 1, hc_mult], [bs*s, 1, hc_mult], [bs*s, 1, hc_mult, hc_mult]
+
+        # [bs*s, hc_mult, 1] * [bs*s, hc_mult, hidden_size] -> [bs*s, hc_mult, hidden_size], then sum over hc_mult -> [bs*s, hidden_size]
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
         return y.to(dtype), post.squeeze(1), comb.squeeze(1)
 
@@ -1069,7 +1078,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        if _SGLANG_OPT_USE_TILELANG_MHC_POST:
             from sglang.srt.layers.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
@@ -1080,6 +1089,9 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         @maybe_torch_compile
         def hc_post_torch_impl(x, residual, post, comb):
+            # post: [bs*s, hc_mult], comb: [bs*s, hc_mult, hc_mult], residual: [bs*s, hc_mult, hidden_size].
+            # post.unsqueeze(-1) * x.unsqueeze(1): [bs*s, hc_mult, 1] * [bs*s, 1, hidden_size] -> [bs*s, hc_mult, hidden_size].
+            # comb.unsqueeze(-1) * residual.unsqueeze(2): [bs*s, hc_mult, hc_mult, 1] * [bs*s, hc_mult, 1, hidden_size] -> [bs*s, hc_mult, hc_mult, hidden_size], then sum over the 1st hc_mult -> [bs*s, hc_mult, hidden_size].
             return (
                 post.unsqueeze(-1) * x.unsqueeze(1)
                 + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
@@ -1095,10 +1107,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+        if _SGLANG_DSV4_2604_SUBMODE == "2604B":
             assert deepseek_v4_moe_code_path_checker.observed == 0
 
-        residual = hidden_states
+        residual = hidden_states  # [bs*seqlen, hidden_size]
         hidden_states, post, comb = self.hc_pre(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
@@ -1125,7 +1137,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
-            and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
+            and _SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER
             and get_attention_tp_size() > 1
             and not get_moe_a2a_backend().is_none()
         )
@@ -1165,7 +1177,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+        if _SGLANG_DSV4_2604_SUBMODE == "2604B":
             assert deepseek_v4_moe_code_path_checker.observed == 1
             deepseek_v4_moe_code_path_checker.observed = 0
 
@@ -1638,7 +1650,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if envs.SGLANG_DSV4_FP4_EXPERTS.get():
                     weights = _dequant_fp8_wo_a(weights)
                 else:
-                    weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                    weights = (
+                        (n, t) for n, t in weights if not n.endswith(".wo_a.scale")
+                    )
                 # ------------------------------------------------------------------------
 
         stacked_params_mapping = [

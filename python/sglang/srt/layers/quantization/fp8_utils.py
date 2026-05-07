@@ -49,6 +49,11 @@ _is_fp8_fnuz = is_fp8_fnuz()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+_SGLANG_HACK_DEEPGEMM_W8A8_FORCE_TRITON = get_bool_env_var(
+    "SGLANG_HACK_DEEPGEMM_W8A8_FORCE_TRITON"
+)
+_SGLANG_HACK_CUSTOM_W8A8_GEMM = get_bool_env_var("SGLANG_HACK_CUSTOM_W8A8_GEMM")
+
 if _use_aiter:
     import aiter
 
@@ -384,9 +389,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
-    assert not get_bool_env_var(
-        "SGLANG_HACK_DEEPGEMM_W8A8_FORCE_TRITON"
-    ), "removed flag"
+    assert not _SGLANG_HACK_DEEPGEMM_W8A8_FORCE_TRITON, "removed flag"
 
     if not (shape_supported and dtype_supported):
         # fall back to triton
@@ -398,7 +401,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
                 weight_scale, weight.shape, block_size
             )
 
-        assert not get_bool_env_var("SGLANG_HACK_CUSTOM_W8A8_GEMM"), "removed flag"
+        assert not _SGLANG_HACK_CUSTOM_W8A8_GEMM, "removed flag"
 
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias

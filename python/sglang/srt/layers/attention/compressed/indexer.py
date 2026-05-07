@@ -19,6 +19,14 @@ from sglang.srt.layers.attention.indexer_topk_capturer import (
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.utils import is_hip
 
+_SGLANG_OPT_USE_TILELANG_INDEXER = envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+_SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+_SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE = (
+    envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get()
+)
+_SGLANG_TOPK_TRANSFORM_512_TORCH = envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+_SGLANG_OPT_USE_TOPK_V2 = envs.SGLANG_OPT_USE_TOPK_V2.get()
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.compressor import CompressorBackend
     from sglang.srt.layers.attention.compressed.metadata import DeepseekV4Metadata
@@ -372,14 +380,14 @@ class C4IndexerBackend:
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+        if _SGLANG_OPT_USE_TILELANG_INDEXER:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        elif _SGLANG_FP8_PAGED_MQA_LOGITS_TORCH:
             fn = fp8_paged_mqa_logits_torch
         else:
-            if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
+            if _SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE != -1:
                 from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
                     fp8_paged_mqa_logits_chunked as fn,
                 )
@@ -420,7 +428,7 @@ class C4IndexerBackend:
                 : core_metadata.c4_sparse_page_indices.size(0)
             ]
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+        if _SGLANG_TOPK_TRANSFORM_512_TORCH:
             topk_transform_512_pytorch_vectorized(
                 logits,
                 indexer_metadata.c4_seq_lens,
@@ -429,7 +437,7 @@ class C4IndexerBackend:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif _SGLANG_OPT_USE_TOPK_V2 and raw_indices is None:
             topk_transform_512_v2(
                 logits,
                 indexer_metadata.c4_seq_lens,

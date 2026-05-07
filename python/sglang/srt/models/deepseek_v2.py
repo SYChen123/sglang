@@ -215,6 +215,23 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "ascend",
 ]
 
+_SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+_SGLANG_OPT_FIX_NEXTN_MEGA_MOE = envs.SGLANG_OPT_FIX_NEXTN_MEGA_MOE.get()
+_SGLANG_OPT_FIX_HASH_MEGA_MOE = envs.SGLANG_OPT_FIX_HASH_MEGA_MOE.get()
+_SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = (
+    envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+)
+_SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH = (
+    envs.SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH.get()
+)
+_SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM = (
+    envs.SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM.get()
+)
+_SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD = envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
+_SGLANG_OPT_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = (
+    envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get()
+)
+
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -640,7 +657,7 @@ class DeepseekV2MoE(nn.Module):
             from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
             if (
-                envs.SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM.get()
+                _SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM
                 and self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
@@ -697,7 +714,7 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             isinstance(self.experts.quant_method, DeepSeekMxfp4MoEMethod)
-            and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
+            and _SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD
         ):
             final_hidden_states = shared_output.add_(
                 final_hidden_states, alpha=self.routed_scaling_factor
@@ -787,7 +804,7 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             isinstance(self.experts.quant_method, DeepSeekMxfp4MoEMethod)
-            and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
+            and _SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD
         ):
             if shared_output is not None:
                 final_hidden_states = shared_output.add_(
@@ -1007,7 +1024,7 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
-        elif envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get():
+        elif _SGLANG_OPT_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO:
             # On GB200: Shared experts overlapped on alt_stream, down gemm overlapped with DeepEP Combine
 
             def _post_dispatch_hook(
@@ -1081,16 +1098,16 @@ class DeepseekV2MoE(nn.Module):
     def _should_use_mega_moe(self, hidden_states: torch.Tensor) -> bool:
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-        if not envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+        if not _SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE:
             return False
         if not getattr(self.experts, "_mega_moe_weights_built", False):
             return False
 
-        if not envs.SGLANG_OPT_FIX_NEXTN_MEGA_MOE.get():
+        if not _SGLANG_OPT_FIX_NEXTN_MEGA_MOE:
             if self.is_nextn:
                 return False
 
-        if not envs.SGLANG_OPT_FIX_HASH_MEGA_MOE.get():
+        if not _SGLANG_OPT_FIX_HASH_MEGA_MOE:
             if self.is_hash:
                 return False
 
@@ -1102,7 +1119,7 @@ class DeepseekV2MoE(nn.Module):
             max_tokens_per_rank = max(global_num_tokens)
         else:
             max_tokens_per_rank = hidden_states.shape[0]
-        cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        cap = _SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK
         return max_tokens_per_rank <= cap
 
     def forward_mega_moe(
@@ -1189,9 +1206,7 @@ class DeepseekV2MoE(nn.Module):
         num_experts = self.experts.num_experts
         top_k = self.config.num_experts_per_tok + self.num_fused_shared_experts
         intermediate_size = self.config.moe_intermediate_size
-        num_max_tokens_per_rank = (
-            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-        )
+        num_max_tokens_per_rank = _SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK
         assert num_tokens <= num_max_tokens_per_rank, (
             f"mega MoE: num_tokens={num_tokens} exceeds cap "
             f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
@@ -1209,7 +1224,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
         padded_max = buf.topk_idx.shape[0]
-        if envs.SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH.get():
+        if _SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH:
             from sglang.jit_kernel.deepseek_v4 import mega_moe_pre_dispatch
 
             if num_tokens > 0:
