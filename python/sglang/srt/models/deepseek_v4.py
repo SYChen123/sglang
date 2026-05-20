@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple
 
 import torch
@@ -15,6 +16,7 @@ from sglang.jit_kernel.deepseek_v4 import fused_rope, rmsnorm_self
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
@@ -919,13 +921,19 @@ class DeepseekV4Model(nn.Module):
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
+            ctx = (
+                nullcontext()
+                if not get_global_server_args().disable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            with ctx:
+                hidden_states = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                )
 
         if nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
