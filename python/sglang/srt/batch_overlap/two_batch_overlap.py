@@ -833,9 +833,11 @@ def model_forward_maybe_tbo(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
-    input_data_scatter_mode: ScatterMode,
-    residual: Optional[torch.Tensor],
+    input_data_scatter_mode: Optional[ScatterMode] = None,
+    residual: Optional[torch.Tensor] = None,
     zero_allocator: Optional[BumpAllocator] = None,
+    extra_token_inputs: Optional[Dict[str, torch.Tensor]] = None,
+    use_layer_communicator: bool = True,
 ):
     inputs = dict(
         positions=positions,
@@ -844,7 +846,13 @@ def model_forward_maybe_tbo(
         residual=residual,
         zero_allocator=zero_allocator,
     )
-    layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
+    if extra_token_inputs is not None:
+        inputs.update(extra_token_inputs)
+    layer_input_scatter_mode = (
+        layers[0].layer_scatter_modes.layer_input_mode
+        if use_layer_communicator
+        else None
+    )
     operations_strategy = OperationsStrategy.init_new_tbo(
         layers, forward_batch.global_forward_mode
     )
@@ -854,6 +862,7 @@ def model_forward_maybe_tbo(
             operations_strategy=operations_strategy,
             input_data_scatter_mode=input_data_scatter_mode,
             layer_input_scatter_mode=layer_input_scatter_mode,
+            use_layer_communicator=use_layer_communicator,
         )
     else:
         return _model_forward_non_tbo(inputs, operations_strategy)
@@ -862,14 +871,20 @@ def model_forward_maybe_tbo(
 def _model_forward_tbo(
     inputs,
     operations_strategy: OperationsStrategy,
-    input_data_scatter_mode: ScatterMode,
-    layer_input_scatter_mode: ScatterMode,
+    input_data_scatter_mode: Optional[ScatterMode],
+    layer_input_scatter_mode: Optional[ScatterMode],
+    use_layer_communicator: bool,
 ):
-    inputs_arr = _model_forward_tbo_split_inputs(
-        **inputs,
-        input_data_scatter_mode=input_data_scatter_mode,
-        layer_input_scatter_mode=layer_input_scatter_mode,
-    )
+    if use_layer_communicator:
+        assert input_data_scatter_mode is not None
+        assert layer_input_scatter_mode is not None
+        inputs_arr = _model_forward_tbo_split_inputs(
+            **inputs,
+            input_data_scatter_mode=input_data_scatter_mode,
+            layer_input_scatter_mode=layer_input_scatter_mode,
+        )
+    else:
+        inputs_arr = _model_forward_tbo_split_inputs_raw(**inputs)
     original_hidden_states_len = inputs["hidden_states"].shape[0]
     del inputs
 
@@ -952,6 +967,7 @@ def _model_forward_tbo_split_inputs_raw(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     zero_allocator: Optional[BumpAllocator],
+    **extra_token_inputs,
 ) -> List[Dict]:
     return [
         dict(
@@ -961,6 +977,7 @@ def _model_forward_tbo_split_inputs_raw(
                 positions=positions,
                 output_forward_batch=output_forward_batch,
                 tbo_subbatch_index=tbo_subbatch_index,
+                extra_token_inputs=extra_token_inputs,
             ),
             **(
                 dict(zero_allocator=zero_allocator)
@@ -980,8 +997,10 @@ def _model_forward_filter_inputs(
     positions: torch.Tensor,
     output_forward_batch: ForwardBatch,
     tbo_subbatch_index: int,
+    extra_token_inputs: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
+    original_num_tokens = hidden_states.shape[0]
     hidden_states = hidden_states[token_slice]
     residual = None if residual is None else residual[token_slice]
     positions = positions[token_slice]
@@ -999,13 +1018,24 @@ def _model_forward_filter_inputs(
         res[: x.shape[0]] = x
         return res
 
-    return dict(
+    output = dict(
         hidden_states=_pad(hidden_states),
         residual=_pad(residual),
         positions=_pad(positions),
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
     )
+    if extra_token_inputs is not None:
+        for key, value in extra_token_inputs.items():
+            if value is None:
+                output[key] = None
+                continue
+            assert (
+                value.shape[0] == original_num_tokens
+            ), f"{key=} {value.shape=} {original_num_tokens=} {output_forward_batch=}"
+            sliced_value = value[token_slice]
+            output[key] = _pad(sliced_value)
+    return output
 
 
 def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):

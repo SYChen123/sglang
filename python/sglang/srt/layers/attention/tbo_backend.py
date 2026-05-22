@@ -15,6 +15,15 @@ class TboAttnBackend(AttentionBackend):
         super().__init__()
         self.primary = primary
         self.children = children
+        self._replay_forward_batch = None
+
+    @property
+    def forward_metadata(self):
+        return getattr(self.primary, "forward_metadata", None)
+
+    @forward_metadata.setter
+    def forward_metadata(self, value):
+        setattr(self.primary, "forward_metadata", value)
 
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
@@ -80,6 +89,7 @@ class TboAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        self.primary._replay_forward_batch = self._replay_forward_batch
         self.primary.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
@@ -90,6 +100,7 @@ class TboAttnBackend(AttentionBackend):
             spec_info=spec_info,
             seq_lens_cpu=seq_lens_cpu,
         )
+        self.primary._replay_forward_batch = None
 
         self._init_forward_metadata_cuda_graph_children(
             fn_name="init_forward_metadata_replay_cuda_graph",
@@ -170,8 +181,19 @@ class TboAttnBackend(AttentionBackend):
         )
 
         child_left, child_right = self.children
+        replay_forward_batch = self._replay_forward_batch
+        replay_children = (
+            replay_forward_batch.tbo_children
+            if replay_forward_batch is not None
+            and replay_forward_batch.tbo_children is not None
+            else [None, None]
+        )
+        child_left._replay_forward_batch = replay_children[0]
         getattr(child_left, fn_name)(**args_left)
+        child_left._replay_forward_batch = None
+        child_right._replay_forward_batch = replay_children[1]
         getattr(child_right, fn_name)(**args_right)
+        child_right._replay_forward_batch = None
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
@@ -190,6 +212,19 @@ class TboAttnBackend(AttentionBackend):
 
     def get_indexer_metadata(self, layer_id: int, forward_batch: "ForwardBatch"):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
+
+    def _maybe_upgrade_forward_metadata(self):
+        if hasattr(self.primary, "_maybe_upgrade_forward_metadata"):
+            return self.primary._maybe_upgrade_forward_metadata()
+
+    def init_forward_metadata_indexer(self, *args, **kwargs):
+        return self.primary.init_forward_metadata_indexer(*args, **kwargs)
+
+    def forward_core_compressor(self, *args, **kwargs):
+        return self.primary.forward_core_compressor(*args, **kwargs)
+
+    def forward_indexer_compressor(self, *args, **kwargs):
+        return self.primary.forward_indexer_compressor(*args, **kwargs)
 
 
 def _init_forward_metadata_cuda_graph_split(

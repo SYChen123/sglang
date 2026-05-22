@@ -45,6 +45,15 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
+        elif layer_name == "DeepseekV4DecoderLayer":
+            return OperationsStrategy.concat(
+                [
+                    _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
+                        layer, forward_mode
+                    )
+                    for layer in layers
+                ]
+            )
         elif layer_name == "Qwen3MoeDecoderLayer":
             return OperationsStrategy.concat(
                 [
@@ -146,6 +155,93 @@ def _compute_moe_deepseek_blog_decode(layer):
             operations.YieldOperation(),
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
+        ],
+    )
+
+
+# -------------------------------- Strategy for DeepSeek V4 ---------------------------------------
+
+
+def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
+    layer: torch.nn.Module,
+    forward_mode: ForwardMode,
+) -> OperationsStrategy:
+    assert layer.is_layer_sparse, "DeepSeek V4 TBO expects sparse MoE layers"
+    if forward_mode == ForwardMode.EXTEND:
+        return _compute_moe_deepseek_v4_prefill(layer)
+    elif (
+        forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
+    ):
+        return _compute_moe_deepseek_v4_decode(layer)
+    else:
+        raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+
+def _compute_moe_deepseek_v4_prefill(layer):
+    device_properties = torch.cuda.get_device_properties(device="cuda")
+    total_num_sms = device_properties.multi_processor_count
+    deep_gemm_num_sms = None
+    if not _is_hip:
+        deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+
+    # Keep prefill coarse-grained, matching the DSV3 TBO strategy. Prefill is
+    # dominated by long attention/MoE kernels; the useful overlap boundaries are
+    # the split DeepEP dispatch/combine phases. Finer hc/layernorm/attention
+    # stages add Python scheduling overhead and keep intermediates alive longer
+    # without opening a new communication boundary to hide.
+    return OperationsStrategy(
+        deep_gemm_num_sms=deep_gemm_num_sms,
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_attn_hc_pre,
+            layer.op_attn_layernorm,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            layer.op_attn_hc_post,
+            layer.op_mlp_hc_pre,
+            layer.op_mlp_layernorm_and_prepare,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            layer.mlp.op_dispatch_a,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_shared_experts,
+            layer.mlp.op_combine_b,
+            layer.mlp.op_output,
+            layer.op_mlp_postprocess_layer,
+        ],
+    )
+
+
+def _compute_moe_deepseek_v4_decode(layer):
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=2,
+        operations=[
+            layer.op_attn_hc_pre,
+            layer.op_attn_layernorm,
+            layer.self_attn.op_prepare,
+            operations.YieldOperation(),
+            layer.self_attn.op_core,
+            layer.op_attn_hc_post,
+            layer.op_mlp_hc_pre,
+            layer.op_mlp_layernorm_and_prepare,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_a,
+            layer.mlp.op_shared_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_combine_b,
+            layer.mlp.op_output,
+            layer.op_mlp_postprocess_layer,
         ],
     )
 

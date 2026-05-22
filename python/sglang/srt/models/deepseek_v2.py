@@ -1241,6 +1241,16 @@ class DeepseekV2MoE(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
+                topk_kwargs = {}
+                if getattr(self, "is_hash", False):
+                    input_ids = state.get("mlp_input_ids_global")
+                    if input_ids is None:
+                        input_ids = state.get("mlp_input_ids")
+                    if input_ids is None:
+                        input_ids = state.get("input_ids_global")
+                    if input_ids is None:
+                        input_ids = state.get("input_ids")
+                    topk_kwargs["input_ids"] = input_ids
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
@@ -1248,6 +1258,7 @@ class DeepseekV2MoE(nn.Module):
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
+                    **topk_kwargs,
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)

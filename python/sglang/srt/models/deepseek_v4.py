@@ -27,6 +27,7 @@ from sglang.jit_kernel.deepseek_v4 import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
@@ -546,19 +547,29 @@ class MQALayer(nn.Module):
 
         return q, kv
 
-    def forward(
+    def forward_prepare(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        torch.Tensor,
+        ForwardBatch,
+        slice,
+    ]:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             assert (
                 not self.wo_b.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
-            return x
+            return x, None, None, None, positions, forward_batch, slice(None)
 
         attn_backend = forward_batch.attn_backend
+        if hasattr(attn_backend, "_maybe_upgrade_forward_metadata"):
+            attn_backend._maybe_upgrade_forward_metadata()
         if TYPE_CHECKING:
             assert isinstance(
                 attn_backend,
@@ -591,6 +602,17 @@ class MQALayer(nn.Module):
             q, kv = self._forward_prepare(
                 x, positions, forward_batch, attn_backend, q_out
             )
+
+        return x, q, q_padded, kv, positions, forward_batch, tp_slice
+
+    def forward_core(self, intermediate_state) -> torch.Tensor:
+        short_circuit_output, q, q_padded, kv, positions, forward_batch, tp_slice = (
+            intermediate_state
+        )
+        if q is None:
+            return short_circuit_output
+
+        attn_backend = forward_batch.attn_backend
 
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
@@ -645,6 +667,51 @@ class MQALayer(nn.Module):
 
         return o
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        (
+            short_circuit_output,
+            q,
+            q_padded,
+            kv,
+            prepared_positions,
+            prepared_forward_batch,
+            tp_slice,
+        ) = self.forward_prepare(
+            x=x,
+            positions=positions,
+            forward_batch=forward_batch,
+        )
+        return self.forward_core(
+            (
+                short_circuit_output,
+                q,
+                q_padded,
+                kv,
+                prepared_positions,
+                prepared_forward_batch,
+                tp_slice,
+            )
+        )
+
+    def op_prepare(self, state):
+        hidden_states_attn_input = state.pop("hidden_states_attn_input")
+        attn_intermediate_state = self.forward_prepare(
+            x=hidden_states_attn_input,
+            positions=state.positions,
+            forward_batch=state.forward_batch,
+        )
+        state.attn_intermediate_state = attn_intermediate_state
+
+    def op_core(self, state):
+        attn_intermediate_state = state.pop("attn_intermediate_state")
+        hidden_states_after_attn = self.forward_core(attn_intermediate_state)
+        state.hidden_states_after_attn = hidden_states_after_attn
+
 
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
@@ -662,6 +729,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
+        self.is_layer_sparse = True
         self.self_attn = MQALayer(
             config=config,
             layer_id=layer_id,
@@ -899,6 +967,183 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         return hc_post_torch_impl(x, residual, post, comb)
 
+    def op_attn_hc_pre(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor] = None,
+        zero_allocator=None,
+        input_ids: Optional[torch.Tensor] = None,
+        input_ids_global: Optional[torch.Tensor] = None,
+        tbo_subbatch_index: Optional[int] = None,
+    ):
+        del residual
+        if input_ids is None:
+            input_ids = forward_batch.input_ids
+        if input_ids_global is None:
+            input_ids_global = input_ids
+
+        state.residual_attn_hc = hidden_states
+        (
+            state.hidden_states_attn_input,
+            state.attn_post,
+            state.attn_comb,
+            state.attn_norm_fused,
+        ) = self.hc_pre(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            norm=self.input_layernorm,
+        )
+        if get_moe_a2a_backend().is_mori():
+            state.num_tokens = hidden_states.shape[0]
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                zero_allocator=zero_allocator,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_attn_layernorm(self, state):
+        hidden_states = state.pop("hidden_states_attn_input")
+        if not state.pop("attn_norm_fused"):
+            hidden_states = self.input_layernorm(hidden_states)
+        state.hidden_states_attn_input = hidden_states
+
+    def op_attn_hc_post(self, state):
+        state.hidden_states_after_attn_hc = self.hc_post(
+            state.pop("hidden_states_after_attn"),
+            state.pop("residual_attn_hc"),
+            state.pop("attn_post"),
+            state.pop("attn_comb"),
+        )
+
+    def op_mlp_hc_pre(self, state):
+        residual = state.pop("hidden_states_after_attn_hc")
+        state.residual_mlp_hc = residual
+        (
+            state.hidden_states_mlp_input,
+            state.mlp_post,
+            state.mlp_comb,
+            state.mlp_norm_fused,
+        ) = self.hc_pre(
+            residual,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            norm=self.post_attention_layernorm,
+        )
+
+    def op_mlp_layernorm_and_prepare(self, state):
+        hidden_states = state.pop("hidden_states_mlp_input")
+        if not state.pop("mlp_norm_fused"):
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
+        forward_batch = state.forward_batch
+        input_ids = state.input_ids
+        input_ids_global = state.input_ids_global
+
+        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        use_tp_moe_gather = (
+            not use_cp
+            and get_attention_dp_size() > 1
+            and get_moe_a2a_backend().is_none()
+        )
+        use_tp_attn_a2a_scatter = (
+            not use_cp
+            and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
+            and get_attention_tp_size() > 1
+            and not get_moe_a2a_backend().is_none()
+        )
+
+        if use_cp:
+            assert get_moe_a2a_backend().is_deepep(), (
+                "CP requires DeepEP (moe_a2a_backend == deepep). "
+                "Only DeepEP is tested with CP's per-rank token split."
+            )
+            cp_rank = get_attention_cp_rank()
+            cp_size = get_attention_cp_size()
+            input_ids = input_ids[cp_rank::cp_size].contiguous()
+            input_ids_global = input_ids
+        elif use_tp_moe_gather:
+            hidden_states, local_hidden_states = (
+                get_global_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
+            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+
+        a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
+        if use_tp_attn_a2a_scatter:
+            s, r = get_attention_tp_size(), get_attention_tp_rank()
+            a2a_scatter_chunks = list(hidden_states.tensor_split(s))
+            hidden_states = a2a_scatter_chunks[r].contiguous()
+            input_ids = input_ids.tensor_split(s)[r].contiguous()
+            input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
+
+        state.hidden_states_mlp_input = hidden_states
+        state.mlp_input_ids = input_ids
+        state.mlp_input_ids_global = input_ids_global
+        state.use_tp_moe_gather = use_tp_moe_gather
+        state.use_tp_attn_a2a_scatter = use_tp_attn_a2a_scatter
+        state.a2a_scatter_chunks = a2a_scatter_chunks
+
+    def op_mlp_postprocess_layer(self, state):
+        hidden_states = state.pop("hidden_states_mlp_output")
+        state.pop("mlp_input_ids")
+        state.pop("mlp_input_ids_global")
+
+        if state.pop("use_tp_moe_gather"):
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
+            dp_scatter(hidden_states, global_hidden_states, state.forward_batch)
+
+        if state.pop("use_tp_attn_a2a_scatter"):
+            a2a_scatter_chunks = state.pop("a2a_scatter_chunks")
+            assert a2a_scatter_chunks is not None
+            gathered = [torch.empty_like(t) for t in a2a_scatter_chunks]
+            attn_tp_all_gather(gathered, hidden_states.contiguous())
+            hidden_states = torch.cat(gathered)
+        else:
+            state.pop("a2a_scatter_chunks")
+
+        hidden_states = self.hc_post(
+            hidden_states,
+            state.pop("residual_mlp_hc"),
+            state.pop("mlp_post"),
+            state.pop("mlp_comb"),
+        )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=None,
+            forward_batch=state.forward_batch,
+            zero_allocator=state.zero_allocator,
+            input_ids=state.input_ids,
+            input_ids_global=state.input_ids_global,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+
+        expect_keys = {
+            "positions",
+            "forward_batch",
+            "zero_allocator",
+            "input_ids",
+            "input_ids_global",
+            "tbo_subbatch_index",
+        }
+        state.clear(expect_keys=expect_keys)
+        return output
+
     def forward(
         self,
         positions: torch.tensor,
@@ -1132,23 +1377,46 @@ class DeepseekV4Model(nn.Module):
 
         # Upgrade lazy raw metadata on the main stream once before any layer
         # forks alt-streams; later per-layer calls become no-ops.
-        forward_batch.attn_backend._maybe_upgrade_forward_metadata()
+        if hasattr(forward_batch.attn_backend, "_maybe_upgrade_forward_metadata"):
+            forward_batch.attn_backend._maybe_upgrade_forward_metadata()
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            ctx = (
-                nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
-                else get_global_expert_distribution_recorder().with_current_layer(i)
+        can_run_tbo = forward_batch.can_run_tbo and not dsa_use_prefill_cp(
+            forward_batch
+        )
+        if can_run_tbo:
+            extra_token_inputs = {"input_ids": input_ids}
+            if (
+                input_ids_global is not None
+                and input_ids_global.shape[0] == hidden_states.shape[0]
+            ):
+                extra_token_inputs["input_ids_global"] = input_ids_global
+
+            hidden_states, _ = model_forward_maybe_tbo(
+                layers=self.layers[self.start_layer : self.end_layer],
+                enable_tbo=True,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=None,
+                extra_token_inputs=extra_token_inputs,
+                use_layer_communicator=False,
             )
-            with ctx:
-                hidden_states = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    input_ids=input_ids,
-                    input_ids_global=input_ids_global,
+        else:
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                ctx = (
+                    nullcontext()
+                    if not get_global_server_args().disable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
+                with ctx:
+                    hidden_states = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                    )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
