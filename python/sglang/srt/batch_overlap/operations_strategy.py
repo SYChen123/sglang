@@ -217,11 +217,6 @@ def _compute_moe_deepseek_v4_decode(layer):
             layer.op_mhc_postprocess,
         ]
     elif get_moe_a2a_backend().is_deepep():
-        total_num_sms = torch.cuda.get_device_properties(
-            device="cuda"
-        ).multi_processor_count
-        deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
-        assert deep_gemm_num_sms > 0
         ops = [
             layer.op_mhc_prepare_attn,
             layer.self_attn.op_attn_prepare,
@@ -245,7 +240,10 @@ def _compute_moe_deepseek_v4_decode(layer):
         ]
         return OperationsStrategy(
             operations=ops,
-            deep_gemm_num_sms=deep_gemm_num_sms,
+            # Decode uses DeepEP low-latency mode. Keep DeepGEMM's default SM
+            # count so the DSV4 indexer's prebuilt schedule metadata matches
+            # the paged-MQA kernel launched inside the TBO execution context.
+            deep_gemm_num_sms=None,
             tbo_delta_stages=2,
         )
     else:
