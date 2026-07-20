@@ -1464,13 +1464,21 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
 
-        # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids; forward_deepep
-        # passes them as a topk kwarg. The per-ubatch forward_batch.input_ids is
-        # already sliced+padded to match hidden_states rows (and equals the
-        # global ids under EP dp-attention). No-op for non-hash models.
+        # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids. TBO slices the
+        # child ids but may TP-align the child hidden states, so pad only that
+        # synthetic tail; num_token_non_padded masks it from routing.
         topk_kwargs = {}
         if getattr(self, "is_hash", False):
-            topk_kwargs["input_ids"] = state.forward_batch.input_ids
+            input_ids = state.forward_batch.input_ids
+            if input_ids.shape[0] != hidden_states.shape[0]:
+                assert state.get("tbo_subbatch_index") is not None
+                assert input_ids.shape[0] < hidden_states.shape[0]
+                input_ids = F.pad(
+                    input_ids,
+                    (0, hidden_states.shape[0] - input_ids.shape[0]),
+                    value=0,
+                )
+            topk_kwargs["input_ids"] = input_ids
 
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(

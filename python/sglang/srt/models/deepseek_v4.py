@@ -72,7 +72,11 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe import (
+    get_deepep_mode,
+    get_moe_a2a_backend,
+    should_use_dp_reduce_scatterv,
+)
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -1068,9 +1072,9 @@ class MQALayer(MqaAttentionBase):
     ):
         """Prepare Q/KV and launch DSV4 indexer/HiSparse swap-in only.
 
-        TBO calls this for both children before running their compute stages;
-        this is what makes child B's swap-in available to overlap child A's
-        attention execution.
+        The operation strategy decides when each child runs this stage. Delta-0
+        backends prepare both children first, while DeepEP's delta-2 pipeline
+        prepares child B during child A's MoE phase.
         """
         attn_backend = get_attn_backend()
         tp_slice, q_padded, q_out = slice(None), None, None
@@ -2500,6 +2504,10 @@ class DeepseekV4Model(nn.Module):
             dp_num_tokens_before_padding is None
             or any(num_tokens < 2 for num_tokens in dp_num_tokens_before_padding)
         )
+        moe_a2a_backend = get_moe_a2a_backend()
+        deepep_decode_tbo_compatible = not (
+            is_hisparse_decode and moe_a2a_backend.is_deepep()
+        ) or (get_deepep_mode().resolve(is_extend_in_batch=False).is_low_latency())
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
@@ -2507,6 +2515,7 @@ class DeepseekV4Model(nn.Module):
             and global_mode is not None
             and (global_mode.is_extend() or is_hisparse_decode)
             and not has_undersized_dp_rank
+            and deepep_decode_tbo_compatible
             and not dsa_use_prefill_cp(forward_batch)
             and self.pp_group.world_size == 1
         )
@@ -2538,6 +2547,7 @@ class DeepseekV4Model(nn.Module):
             _model_forward_filter_inputs,
             _model_forward_tbo_merge_outputs,
         )
+        from sglang.srt.layers import deep_gemm_wrapper
 
         layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
         operations_strategy = OperationsStrategy.init_new_tbo(
@@ -2604,11 +2614,19 @@ class DeepseekV4Model(nn.Module):
                 tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
                 child._tbo_global_input_ids = gids
 
-        outputs_arr = execute_overlapped_operations(
-            inputs_arr=inputs_arr,
-            operations_arr=[operations_strategy.operations] * 2,
-            delta_stages=[0, operations_strategy.tbo_delta_stages],
+        deep_gemm_context = (
+            nullcontext()
+            if _is_hip
+            else deep_gemm_wrapper.configure_deep_gemm_num_sms(
+                operations_strategy.deep_gemm_num_sms
+            )
         )
+        with deep_gemm_context:
+            outputs_arr = execute_overlapped_operations(
+                inputs_arr=inputs_arr,
+                operations_arr=[operations_strategy.operations] * 2,
+                delta_stages=[0, operations_strategy.tbo_delta_stages],
+            )
 
         hidden_states, _ = _model_forward_tbo_merge_outputs(
             outputs_arr[0], outputs_arr[1], hidden_states.shape[0]

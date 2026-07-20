@@ -184,11 +184,9 @@ def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
 def _compute_moe_deepseek_v4_decode(layer):
     from sglang.srt.layers.moe import get_moe_a2a_backend
 
-    # The first stage is intentionally only the attention-side prepare.  Both
-    # children therefore launch HiSparse swap-in before either child enters
-    # the long attention+MegaMoE stage.  Do not insert a YieldOperation after
-    # op_attn_compute: that would switch to child B before child A's MoE has
-    # had a chance to hide child B's swap-in.
+    # Delta-0 backends keep the first stage to attention-side prepare so both
+    # children launch HiSparse swap-in before child A enters its long compute
+    # stage. DeepEP uses the separate delta-2 pipeline below.
     if get_moe_a2a_backend().is_megamoe():
         # MegaMoE is a fused routed-MoE call, not the DeepEP dispatcher
         # decomposition below. Keep it in the same stage as attention so the
@@ -218,6 +216,38 @@ def _compute_moe_deepseek_v4_decode(layer):
             layer.op_combine_b,
             layer.op_mhc_postprocess,
         ]
+    elif get_moe_a2a_backend().is_deepep():
+        total_num_sms = torch.cuda.get_device_properties(
+            device="cuda"
+        ).multi_processor_count
+        deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+        assert deep_gemm_num_sms > 0
+        ops = [
+            layer.op_mhc_prepare_attn,
+            layer.self_attn.op_attn_prepare,
+            operations.YieldOperation(),
+            layer.self_attn.op_attn_compute,
+            layer.op_mhc_post_attn_pre_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_a,
+            layer.mlp.op_shared_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_combine_b,
+            operations.YieldOperation(),
+            layer.mlp.op_output,
+            layer.op_mhc_postprocess,
+        ]
+        return OperationsStrategy(
+            operations=ops,
+            deep_gemm_num_sms=deep_gemm_num_sms,
+            tbo_delta_stages=2,
+        )
     else:
         ops = [
             layer.op_mhc_prepare_attn,
