@@ -247,6 +247,11 @@ class NGRAMWorker(BaseSpecWorker):
         self.tree_mask = torch.empty(
             (max_total_mask_size,), dtype=torch.bool, device=self.device
         )
+        fallback_mask_indices = torch.arange(self.draft_token_num, device=self.device)
+        self.fallback_tree_mask = (
+            (fallback_mask_indices[:, None] == fallback_mask_indices[None, :])
+            | (fallback_mask_indices[None, :] == 0)
+        ).unsqueeze(0)
 
         self.draft_tokens_batch = []
         self.tree_mask_batch = []
@@ -553,10 +558,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         fallback_drafts = torch.zeros_like(cached_drafts)
         fallback_drafts[:, 0] = bonus_tokens.to(dtype=fallback_drafts.dtype)
-        fallback_masks = torch.zeros_like(cached_masks)
-        fallback_masks[:, :, 0] = True
-        diag_indices = torch.arange(d, device=fallback_masks.device)
-        fallback_masks[:, diag_indices, diag_indices] = True
+        fallback_masks = self.fallback_tree_mask.expand(bs, -1, -1)
 
         selected_drafts = torch.where(
             cache_hits[:, None], cached_drafts, fallback_drafts
