@@ -57,7 +57,7 @@ def _build_tree_query_kv_layout_kernel(
     # but attention kernels still require every query to have valid metadata.
     is_padding_root = (~is_real_req) & (key_idx == 0)
     tl.store(
-        kv_slots_ptr + row * kv_slots_stride,
+        kv_slots_ptr + row * kv_slots_stride + key_idx,
         0,
         mask=is_padding_root,
     )
