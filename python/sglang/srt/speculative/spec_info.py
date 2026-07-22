@@ -277,6 +277,15 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
         }
 
+    def get_compact_tree_mask(self) -> Optional[torch.Tensor]:
+        """Return a flattened ``[num_reqs, D, D]`` tree mask when available.
+
+        Attention backends use this capability instead of dispatching on a
+        concrete speculative algorithm. Inputs that carry a full attention
+        mask, or no tree at all, keep the default ``None`` result.
+        """
+        return None
+
     @abstractmethod
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         pass

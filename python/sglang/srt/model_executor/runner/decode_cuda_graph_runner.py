@@ -43,6 +43,7 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -1079,14 +1080,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
+            enable_precompute = envs.SGLANG_ENABLE_NGRAM_PRECOMPUTE.get()
+            draft_token_num = self.num_tokens_per_bs
+            batch_size = num_tokens // draft_token_num
             spec_info = NgramVerifyInput(
                 draft_token=None,
-                custom_mask=self.buffers.custom_mask,
+                custom_mask=(
+                    self.buffers.custom_mask[
+                        : batch_size * draft_token_num * draft_token_num
+                    ]
+                    if enable_precompute
+                    else self.buffers.custom_mask
+                ),
                 positions=None,
                 retrieve_index=None,
                 retrieve_next_token=None,
                 retrieve_next_sibling=None,
-                draft_token_num=self.num_tokens_per_bs,
+                draft_token_num=draft_token_num,
+                is_compact_mask=enable_precompute,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 

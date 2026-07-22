@@ -672,8 +672,8 @@ class NGRAMWorker(BaseSpecWorker):
             self.draft_token_num,
         )
 
-        # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
-        # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
+        # Precompute keeps the compact tree mask for FA3/FA4's cascade page-table
+        # builder. The legacy path still materializes the backend-agnostic full mask.
         is_compact_mask = self.enable_precompute
         if USE_FULL_MASK and not is_compact_mask:
             compact_tree_mask = tree_mask.reshape(
@@ -695,13 +695,6 @@ class NGRAMWorker(BaseSpecWorker):
                 ).to(torch.bool)
                 full_tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(full_tree_mask, dim=0)
-
-        # prepare_for_decode reserves the complete speculative KV footprint on
-        # the host. Its sum is a synchronization-free upper bound for ragged
-        # FlashInfer buffers, including continuous-batching additions/removals.
-        paged_kernel_lens_capacity = (
-            sum(req.kv_allocated_len for req in batch.reqs) if is_compact_mask else None
-        )
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
@@ -726,7 +719,6 @@ class NGRAMWorker(BaseSpecWorker):
             retrieve_next_sibling=retrieve_next_sibling,
             draft_token_num=self.draft_token_num,
             is_compact_mask=is_compact_mask,
-            paged_kernel_lens_capacity=paged_kernel_lens_capacity,
         )
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):

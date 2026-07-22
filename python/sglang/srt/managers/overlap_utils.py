@@ -25,8 +25,9 @@ def decide_needs_cpu_seq_lens(
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
     NGRAM precompute is an all-or-nothing fully-overlapped mode: its compact
-    tree mask is expanded on GPU, and every attention backend must explicitly
-    support GPU-only sequence lengths. Other modes retain the backend OR.
+    tree mask is converted to attention metadata on GPU, and every attention
+    backend must explicitly support GPU-only sequence lengths. Other modes
+    retain the backend OR.
     """
     spec_algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
     ngram_precompute = (
@@ -312,9 +313,9 @@ class FutureMap:
         )
         if use_gpu_only_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify).
-            # NGRAM precompute expands its mask on GPU and result processing
-            # later waits on GenerationBatchResult.copy_done, like normal
-            # overlap scheduling, so no current host mirror is needed here.
+            # NGRAM precompute builds FA tree metadata on GPU and result
+            # processing later waits on GenerationBatchResult.copy_done, like
+            # normal overlap scheduling, so no current host mirror is needed.
             batch.seq_lens_cpu = None
             batch.seq_lens_sum = None
             return
