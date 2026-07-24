@@ -1090,6 +1090,15 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = False
+    enable_tp_lm_head_all_to_all: A[
+        bool,
+        "Use all-to-all instead of TP all-gather followed by DP scatter for the "
+        "TP-sharded LM head under DP attention. This experimental path requires "
+        "tp_size == dp_size, attn_cp_size == 1, and --enable-dp-lm-head to be "
+        "disabled. Batches without an equal padded row count fall back to the "
+        "existing all-gather path.",
+        NS("parallel"),
+    ] = False
     enable_attn_tp_input_scattered: A[
         bool,
         "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
