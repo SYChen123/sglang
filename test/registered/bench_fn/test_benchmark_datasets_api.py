@@ -34,6 +34,7 @@ from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
 from sglang.benchmark.datasets.custom import sample_custom_requests
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
+    _gen_prompt_with_seed,
     _zipf_group_probs,
     get_gen_prefix_cache_path,
     sample_generated_shared_prefix_requests,
@@ -531,6 +532,26 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         )
         self.assertEqual(len(rows), 4)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
+
+    def test_generated_shared_prefix_is_independent_of_vocab_iteration_order(self):
+        class FakeTokenizer:
+            def __init__(self, vocab_items):
+                self.vocab_items = vocab_items
+
+            def get_vocab(self):
+                return dict(self.vocab_items)
+
+            def decode(self, token_ids):
+                return ",".join(map(str, token_ids))
+
+        vocab_items = [(f"token_{token_id}", token_id) for token_id in range(128)]
+        tokenizer_a = FakeTokenizer(vocab_items)
+        tokenizer_b = FakeTokenizer(reversed(vocab_items))
+
+        prompt_a = _gen_prompt_with_seed(tokenizer_a, token_num=512, seed=12345)
+        prompt_b = _gen_prompt_with_seed(tokenizer_b, token_num=512, seed=12345)
+
+        self.assertEqual(prompt_a, prompt_b)
 
     def test_image_sampler(self):
         rows = sample_image_requests(

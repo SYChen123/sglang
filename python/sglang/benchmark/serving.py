@@ -31,7 +31,17 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    AsyncGenerator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import aiohttp
 import numpy as np
@@ -40,8 +50,14 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from sglang.benchmark.arrival_schedule import generate_arrival_schedule
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.multiprocess_control import (
+    MultiprocessWorkerControl,
+    create_worker_control,
+)
+from sglang.benchmark.peak_metrics import RequestTiming, calculate_peak_metrics
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1057,7 +1073,30 @@ async def get_request(
     request_rate: float,
     use_trace_timestamps: bool = False,
     slowdown_factor: float = 1.0,
+    arrival_schedule: Optional[Sequence[float]] = None,
+    schedule_start_time: Optional[float] = None,
 ) -> AsyncGenerator[DatasetRow, None]:
+    if arrival_schedule is not None:
+        if use_trace_timestamps:
+            raise ValueError(
+                "arrival_schedule and use_trace_timestamps are mutually exclusive"
+            )
+        if len(arrival_schedule) != len(input_requests):
+            raise ValueError(
+                "arrival schedule length does not match request count: "
+                f"{len(arrival_schedule)} != {len(input_requests)}"
+            )
+
+        start_time = (
+            time.perf_counter() if schedule_start_time is None else schedule_start_time
+        )
+        for request, offset in zip(input_requests, arrival_schedule):
+            sleep_duration = start_time + offset - time.perf_counter()
+            if sleep_duration > 0:
+                await asyncio.sleep(sleep_duration)
+            yield request
+        return
+
     if use_trace_timestamps:
         print(
             f"Using trace timestamps for request generation with slowdown factor {slowdown_factor}."
@@ -1090,6 +1129,24 @@ async def get_request(
             interval = np.random.exponential(1.0 / request_rate)
             # The next request will be sent after the interval.
             await asyncio.sleep(interval)
+
+
+def _get_metric_itls(
+    output: RequestFuncOutput,
+    tokenizer: PreTrainedTokenizerBase,
+    use_retokenized_itl: bool,
+) -> List[float]:
+    if not use_retokenized_itl:
+        return output.itl
+
+    metric_itls = []
+    for k, itl in enumerate(output.itl):
+        num_tokens = len(
+            tokenizer.encode(output.text_chunks[k], add_special_tokens=False)
+        )
+        adjusted_itl = itl / num_tokens
+        metric_itls.extend([adjusted_itl] * num_tokens)
+    return metric_itls
 
 
 def calculate_metrics(
@@ -1133,17 +1190,11 @@ def calculate_metrics(
                 total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
+            metric_itls = _get_metric_itls(outputs[i], tokenizer, use_retokenized_itl)
             if use_retokenized_itl:
-                for k, itl in enumerate(outputs[i].itl):
-                    num_tokens = len(
-                        tokenizer.encode(
-                            outputs[i].text_chunks[k], add_special_tokens=False
-                        )
-                    )
-                    adjusted_itl = itl / num_tokens
-                    retokenized_itls.extend([adjusted_itl] * num_tokens)
+                retokenized_itls.extend(metric_itls)
             else:
-                itls += outputs[i].itl
+                itls.extend(metric_itls)
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
@@ -1160,69 +1211,39 @@ def calculate_metrics(
             stacklevel=2,
         )
 
-    max_output_tokens_per_s = 0.0
-    max_concurrent_requests = 0
-
     successful_outputs = [output for output in outputs if output.success]
-    if successful_outputs:
-        min_start_time = min(output.start_time for output in successful_outputs)
-        max_end_time = max(
-            output.start_time + output.latency for output in successful_outputs
-        )
-
-        duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
-        tokens_per_second = np.zeros(duration_seconds)
-        concurrent_requests_per_second = np.zeros(duration_seconds)
-
-        for output in outputs:
-            if not output.success:
-                continue
-
-            token_times = [output.start_time + output.ttft]
-            current_time = token_times[0]
-            for itl_value in output.itl:
-                current_time += itl_value
-                token_times.append(current_time)
-
-            for token_time in token_times:
-                second_bucket = int(token_time - min_start_time)
-                if 0 <= second_bucket < duration_seconds:
-                    tokens_per_second[second_bucket] += 1
-
-            request_start_second = int(output.start_time - min_start_time)
-            request_end_second = int(
-                (output.start_time + output.latency) - min_start_time
+    peak_metrics = calculate_peak_metrics(
+        [
+            RequestTiming(
+                start_time=output.start_time,
+                latency=output.latency,
+                ttft=output.ttft,
+                itls=output.itl,
             )
+            for output in successful_outputs
+        ]
+    )
 
-            for second in range(
-                request_start_second, min(request_end_second + 1, duration_seconds)
-            ):
-                concurrent_requests_per_second[second] += 1
+    if plot_throughput and successful_outputs:
+        if TERM_PLOTLIB_AVAILABLE:
+            import termplotlib as tpl
 
-        if len(tokens_per_second) > 0:
-            max_output_tokens_per_s = float(np.max(tokens_per_second))
-            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
-
-        if plot_throughput:
-            if TERM_PLOTLIB_AVAILABLE:
-                import termplotlib as tpl
-
-                fig = tpl.figure()
-                fig.plot(
-                    np.arange(len(tokens_per_second)),
-                    tokens_per_second,
-                    title="Output tokens per second",
-                    xlabel="Time (s)",
-                )
-                fig.plot(
-                    np.arange(len(concurrent_requests_per_second)),
-                    concurrent_requests_per_second,
-                    title="Concurrent requests per second",
-                    xlabel="Time (s)",
-                )
-                fig.show()
-            else:
-                print("tip: install termplotlib and gnuplot to plot the metrics")
+            fig = tpl.figure()
+            fig.plot(
+                np.arange(len(peak_metrics.tokens_per_second)),
+                peak_metrics.tokens_per_second,
+                title="Output tokens per second",
+                xlabel="Time (s)",
+            )
+            fig.plot(
+                np.arange(len(peak_metrics.concurrent_requests_per_second)),
+                peak_metrics.concurrent_requests_per_second,
+                title="Concurrent requests per second",
+                xlabel="Time (s)",
+            )
+            fig.show()
+        else:
+            print("tip: install termplotlib and gnuplot to plot the metrics")
 
     itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
@@ -1266,11 +1287,71 @@ def calculate_metrics(
         p95_e2e_latency_ms=np.percentile(e2e_latencies, 95) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
-        max_output_tokens_per_s=max_output_tokens_per_s,
-        max_concurrent_requests=max_concurrent_requests,
+        max_output_tokens_per_s=peak_metrics.max_output_tokens_per_s,
+        max_concurrent_requests=peak_metrics.max_concurrent_requests,
     )
 
     return metrics, output_lens
+
+
+def _shard_input_requests(
+    input_requests: List[Any], *, already_sharded: bool = False
+) -> List[Any]:
+    shard_count_raw = os.getenv("SGLANG_BENCH_NUM_SHARDS")
+    shard_index_raw = os.getenv("SGLANG_BENCH_SHARD_INDEX")
+    if shard_count_raw is None and shard_index_raw is None:
+        return input_requests
+    if shard_count_raw is None or shard_index_raw is None:
+        raise ValueError(
+            "SGLANG_BENCH_NUM_SHARDS and SGLANG_BENCH_SHARD_INDEX must be set together"
+        )
+
+    shard_count = int(shard_count_raw)
+    shard_index = int(shard_index_raw)
+    expected_count_raw = os.getenv("SGLANG_BENCH_EXPECTED_NUM_REQUESTS")
+    if shard_count <= 0 or not 0 <= shard_index < shard_count:
+        raise ValueError(
+            f"Invalid benchmark shard: index={shard_index}, count={shard_count}"
+        )
+
+    if already_sharded:
+        if expected_count_raw is None:
+            raise ValueError(
+                "SGLANG_BENCH_EXPECTED_NUM_REQUESTS is required for a "
+                "pre-sharded benchmark dataset"
+            )
+        expected_total = int(expected_count_raw)
+        expected_shard_size = len(range(shard_index, expected_total, shard_count))
+        if len(input_requests) != expected_shard_size:
+            raise ValueError(
+                f"Pre-sharded benchmark dataset {shard_index}/{shard_count} has "
+                f"{len(input_requests)} requests, expected {expected_shard_size} "
+                f"from a global total of {expected_total}"
+            )
+        print(
+            f"Using pre-sharded benchmark requests {shard_index}/{shard_count}: "
+            f"{len(input_requests)} of {expected_total} requests"
+        )
+        return input_requests
+
+    if expected_count_raw is not None and len(input_requests) != int(
+        expected_count_raw
+    ):
+        raise ValueError(
+            "Loaded benchmark dataset size does not match the launcher request: "
+            f"expected {expected_count_raw}, got {len(input_requests)}"
+        )
+
+    sharded_requests = input_requests[shard_index::shard_count]
+    if not sharded_requests:
+        raise ValueError(
+            f"Benchmark shard {shard_index}/{shard_count} contains no requests"
+        )
+    print(
+        f"Using benchmark request shard {shard_index}/{shard_count}: "
+        f"{len(sharded_requests)} of {len(input_requests)} requests"
+    )
+    return sharded_requests
 
 
 MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
@@ -1354,10 +1435,13 @@ async def benchmark(
     flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
     warmup_requests: int = 1,
     use_trace_timestamps: bool = False,
+    arrival_seed: int = 42,
+    arrival_schedule: Optional[Sequence[float]] = None,
     mooncake_slowdown_factor=1.0,
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    multiprocess_control: Optional[MultiprocessWorkerControl] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1374,10 +1458,19 @@ async def benchmark(
     )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
+        if multiprocess_control is not None:
+            raise ValueError(
+                "Multi-process benchmark does not yet support multi-turn "
+                "requests with exact single-process result ordering."
+            )
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
-    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+    semaphore = (
+        asyncio.Semaphore(max_concurrency)
+        if max_concurrency and multiprocess_control is None
+        else None
+    )
 
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
@@ -1454,16 +1547,23 @@ async def benchmark(
             f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
         )
 
-    # Flush cache after warmup so the measured run does not benefit from
-    # request-local prefix reuse. vLLM exposes a different, development-mode
-    # endpoint for the same purpose.
-    should_flush_cache = (
-        "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
-    ) or flush_cache
-    if should_flush_cache:
-        flush_server_cache(base_url, backend, flush_cache_timeout)
-
-    time.sleep(1.0)
+    # The multi-process launcher performs one coordinated flush after every
+    # worker finishes warmup, then releases all workers at the same time.
+    multiprocess_start_time = None
+    if multiprocess_control is not None:
+        multiprocess_start_time = await multiprocess_control.ready_and_wait_start(
+            len(input_requests)
+        )
+    else:
+        # Flush cache after warmup so the measured run does not benefit from
+        # request-local prefix reuse. vLLM exposes a different, development-mode
+        # endpoint for the same purpose.
+        should_flush_cache = (
+            "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
+        ) or flush_cache
+        if should_flush_cache:
+            flush_server_cache(base_url, backend, flush_cache_timeout)
+        time.sleep(1.0)
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
@@ -1489,22 +1589,76 @@ async def benchmark(
                 print("Profiler started")
 
     # Run all requests
-    benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
-    pbar_total = len(input_requests)
     if (
+        multiprocess_control is None
+        and arrival_schedule is None
+        and args.dataset_name != "mooncake"
+        and not use_trace_timestamps
+    ):
+        arrival_schedule = generate_arrival_schedule(
+            len(input_requests), request_rate, arrival_seed
+        )
+
+    benchmark_start_time = (
+        time.perf_counter()
+        if multiprocess_start_time is None
+        else multiprocess_start_time
+    )
+    tasks: List[asyncio.Task] = []
+    global_request_ids: List[int] = []
+    pbar_total = len(input_requests)
+    if multiprocess_control is not None:
+
+        async def controlled_request_generator():
+            async for dispatch in multiprocess_control.iter_dispatches(
+                len(input_requests)
+            ):
+                if not 0 <= dispatch.local_request_id < len(input_requests):
+                    raise RuntimeError(
+                        "coordinator dispatched invalid local request id "
+                        f"{dispatch.local_request_id} for worker shard of "
+                        f"{len(input_requests)} requests"
+                    )
+                yield (
+                    input_requests[dispatch.local_request_id],
+                    dispatch.global_request_id,
+                )
+
+        request_generator = controlled_request_generator()
+    elif (
         backend == "sglang" and args.dataset_name == "mooncake"
     ):  # Assuming mooncake is mainly for sglang or similar backends
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
-        request_generator = get_mooncake_request_over_time(
-            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
-        )
         print(
             f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
         )
         pbar_total *= args.mooncake_num_rounds
+
+        async def mooncake_request_generator():
+            async for request in get_mooncake_request_over_time(
+                input_requests,
+                tokenizer,
+                mooncake_slowdown_factor,
+                mooncake_num_rounds,
+            ):
+                yield request, None
+
+        request_generator = mooncake_request_generator()
     else:
-        request_generator = get_request(input_requests, request_rate)
+        base_request_generator = get_request(
+            input_requests,
+            request_rate,
+            use_trace_timestamps=use_trace_timestamps,
+            slowdown_factor=mooncake_slowdown_factor,
+            arrival_schedule=arrival_schedule,
+            schedule_start_time=benchmark_start_time,
+        )
+
+        async def scheduled_request_generator():
+            async for request in base_request_generator:
+                yield request, None
+
+        request_generator = scheduled_request_generator()
 
     # Prepare LoRA request distribution parameters
     if lora_request_distribution == "distinct":
@@ -1517,7 +1671,24 @@ async def benchmark(
         lora_probs = None
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
-    async for request in request_generator:
+
+    async def run_controlled_request(request_func_input, pbar, global_request_id):
+        assert multiprocess_control is not None
+        try:
+            output = await limited_request_func(
+                request_func_input=request_func_input, pbar=pbar
+            )
+        except BaseException as exc:
+            await multiprocess_control.request_error(global_request_id, exc)
+            raise
+        await multiprocess_control.request_done(
+            global_request_id, success=output.success
+        )
+        return output
+
+    async for request, global_request_id in request_generator:
+        if global_request_id is not None:
+            global_request_ids.append(global_request_id)
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
                 lora_name = random.choice(lora_names)
@@ -1550,12 +1721,26 @@ async def benchmark(
             routing_key=request.routing_key,
         )
 
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+        request_coroutine = (
+            limited_request_func(request_func_input=request_func_input, pbar=pbar)
+            if global_request_id is None
+            else run_controlled_request(
+                request_func_input=request_func_input,
+                pbar=pbar,
+                global_request_id=global_request_id,
             )
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+        tasks.append(asyncio.create_task(request_coroutine))
+    try:
+        outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+        if multiprocess_control is not None:
+            benchmark_end_time = time.perf_counter()
+            await multiprocess_control.wait_for_finish()
+    finally:
+        if multiprocess_control is not None:
+            multiprocess_control.close()
+    if multiprocess_control is None:
+        benchmark_end_time = time.perf_counter()
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -1601,7 +1786,7 @@ async def benchmark(
         accept_length = None
 
     # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
+    benchmark_duration = benchmark_end_time - benchmark_start_time
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else input_requests,
         outputs=outputs,
@@ -1790,6 +1975,7 @@ async def benchmark(
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
+            "arrival_seed": arrival_seed,
             "max_concurrency": max_concurrency,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
@@ -1799,6 +1985,8 @@ async def benchmark(
             "server_info": server_info,
             # Results
             "duration": benchmark_duration,
+            "benchmark_start_time": benchmark_start_time,
+            "benchmark_end_time": benchmark_end_time,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
             "total_input_text_tokens": metrics.total_input_text,
@@ -1871,14 +2059,44 @@ async def benchmark(
                 f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
             )
 
+    use_retokenized_metric_itl = (
+        accept_length is not None
+        and accept_length > 0
+        and backend in ("sglang-oai", "sglang-oai-chat")
+    )
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": output_lens,
+        "successes": [output.success for output in outputs],
+        "latencies": [output.latency for output in outputs],
+        "start_times": [output.start_time for output in outputs],
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    if multiprocess_control is not None:
+        result_details["global_request_ids"] = global_request_ids
+    if multiprocess_control is not None:
+        result_details["_raw_metric_itls"] = [
+            output.itl if output.success else [] for output in outputs
+        ]
+        result_details["_retokenized_metric_itls"] = [
+            (_get_metric_itls(output, tokenizer, True) if output.success else [])
+            for output in outputs
+        ]
+    elif use_retokenized_metric_itl:
+        result_details["metric_itls"] = [
+            (
+                _get_metric_itls(output, tokenizer, use_retokenized_metric_itl)
+                if output.success
+                else []
+            )
+            for output in outputs
+        ]
+    if not _get_bool_env_var("SGLANG_BENCH_OMIT_GENERATED_TEXT"):
+        result_details["generated_texts"] = [
+            output.generated_text for output in outputs
+        ]
 
     if args.cache_report:
         result_details["cached_tokens"] = [o.cached_tokens for o in outputs]
@@ -1995,6 +2213,28 @@ def run_benchmark(args_: argparse.Namespace):
             args.backend == "sglang"
         ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
 
+    if getattr(args, "prepare_only", False):
+        if args.dataset_name != "generated-shared-prefix":
+            raise ValueError(
+                "--prepare-only currently supports only "
+                "--dataset-name generated-shared-prefix"
+            )
+        tokenizer_id = args.tokenizer or args.model
+        if tokenizer_id is None:
+            raise ValueError("--prepare-only requires --model or --tokenizer")
+        model_id = args.served_model_name or args.model or tokenizer_id
+        tokenizer = get_tokenizer(tokenizer_id)
+        input_requests = get_dataset(args, tokenizer, model_id)
+        input_requests = _shard_input_requests(
+            input_requests,
+            already_sharded=True,
+        )
+        print(
+            "Dataset preparation completed: "
+            f"{len(input_requests)} requests prepared for this shard."
+        )
+        return {"prepared_requests": len(input_requests)}
+
     # Set url
     if args.port is None:
         args.port = {
@@ -2104,6 +2344,17 @@ def run_benchmark(args_: argparse.Namespace):
 
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
+    input_requests = _shard_input_requests(
+        input_requests,
+        already_sharded=args.dataset_name == "generated-shared-prefix",
+    )
+    multiprocess_control = create_worker_control()
+    arrival_schedule = None
+
+    request_seed = os.getenv("SGLANG_BENCH_REQUEST_SEED")
+    if request_seed is not None:
+        random.seed(int(request_seed))
+        np.random.seed(int(request_seed))
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
@@ -2143,10 +2394,17 @@ def run_benchmark(args_: argparse.Namespace):
             flush_cache_timeout=args.flush_cache_timeout,
             warmup_requests=args.warmup_requests,
             use_trace_timestamps=args.use_trace_timestamps,
+            arrival_seed=(
+                args.seed
+                if getattr(args, "arrival_seed", None) is None
+                else args.arrival_seed
+            ),
+            arrival_schedule=arrival_schedule,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            multiprocess_control=multiprocess_control,
         )
     )
 
@@ -2196,7 +2454,7 @@ class LoRAPathAction(argparse.Action):
             getattr(namespace, self.dest).append(lora_name)
 
 
-def cli_main():
+def cli_main(argv: Optional[Sequence[str]] = None):
     parser = ArgumentParser(description="Benchmark the online serving throughput.")
     parser.add_argument(
         "--backend",
@@ -2296,6 +2554,39 @@ def cli_main():
         type=int,
         default=1000,
         help="Number of prompts to process. Default is 1000.",
+    )
+    parser.add_argument(
+        "--num-processes",
+        type=int,
+        default=1,
+        help=(
+            "Number of local load-generator processes. Values greater than 1 "
+            "use one parent process to coordinate the global arrival schedule "
+            "and optional global concurrency limit."
+        ),
+    )
+    parser.add_argument(
+        "--multiprocess-child-output-dir",
+        type=str,
+        default=None,
+        help="Directory for per-process benchmark results and logs.",
+    )
+    parser.add_argument(
+        "--multiprocess-barrier-timeout-sec",
+        type=float,
+        default=1800,
+        help=(
+            "Maximum time to wait for all load-generator processes to finish "
+            "dataset preparation and warmup."
+        ),
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help=(
+            "Prepare and cache the generated-shared-prefix dataset without "
+            "connecting to or sending requests to a serving endpoint."
+        ),
     )
     parser.add_argument(
         "--sharegpt-output-len",
@@ -2443,6 +2734,15 @@ def cli_main():
         "Supported with sglang backends (native, oai, oai-chat).",
     )
     parser.add_argument("--seed", type=int, default=42, help="The random seed.")
+    parser.add_argument(
+        "--arrival-seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed for the open-loop request arrival schedule. Defaults to --seed "
+            "and is isolated from dataset generation randomness."
+        ),
+    )
     parser.add_argument(
         "--disable-ignore-eos",
         action="store_true",
@@ -2743,9 +3043,18 @@ def cli_main():
         default=None,
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
-    args = parser.parse_args()
+    benchmark_args = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(benchmark_args)
     _validate_parsed_gsp_args(parser, args)
-    run_benchmark(args)
+    if args.num_processes <= 0:
+        parser.error("--num-processes must be positive")
+    if args.num_processes > 1:
+        from sglang.benchmark.multiprocess_serving import (
+            run_multiprocess_benchmark,
+        )
+
+        return run_multiprocess_benchmark(args, benchmark_args, parser)
+    return run_benchmark(args)
 
 
 if __name__ == "__main__":

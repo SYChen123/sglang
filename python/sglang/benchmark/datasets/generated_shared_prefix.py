@@ -1,4 +1,6 @@
+import hashlib
 import math
+import os
 import pickle
 import random
 import uuid
@@ -6,7 +8,7 @@ from argparse import Namespace
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 from tqdm.asyncio import tqdm
@@ -17,7 +19,32 @@ from sglang.benchmark.datasets.common import (
     DatasetRow,
     compute_random_lens,
     gen_prompt,
+    get_available_tokens,
 )
+
+GSP_SHARD_CACHE_VERSION = 2
+GSP_SHARD_COUNT_ENV = "SGLANG_BENCH_NUM_SHARDS"
+GSP_SHARD_INDEX_ENV = "SGLANG_BENCH_SHARD_INDEX"
+GSP_EXPECTED_REQUESTS_ENV = "SGLANG_BENCH_EXPECTED_NUM_REQUESTS"
+
+
+def _get_multiprocess_shard() -> Optional[Tuple[int, int]]:
+    shard_count_raw = os.getenv(GSP_SHARD_COUNT_ENV)
+    shard_index_raw = os.getenv(GSP_SHARD_INDEX_ENV)
+    if shard_count_raw is None and shard_index_raw is None:
+        return None
+    if shard_count_raw is None or shard_index_raw is None:
+        raise ValueError(
+            f"{GSP_SHARD_COUNT_ENV} and {GSP_SHARD_INDEX_ENV} must be set together"
+        )
+
+    shard_count = int(shard_count_raw)
+    shard_index = int(shard_index_raw)
+    if shard_count <= 0 or not 0 <= shard_index < shard_count:
+        raise ValueError(
+            f"Invalid GSP benchmark shard: index={shard_index}, count={shard_count}"
+        )
+    return shard_count, shard_index
 
 
 def _zipf_group_probs(num_groups: int, alpha: float) -> np.ndarray:
@@ -102,6 +129,19 @@ class GeneratedSharedPrefixDataset(BaseDataset):
     def load(
         self, tokenizer: PreTrainedTokenizerBase, model_id=None
     ) -> List[DatasetRow]:
+        shard = _get_multiprocess_shard()
+        if shard is not None:
+            expected_count_raw = os.getenv(GSP_EXPECTED_REQUESTS_ENV)
+            actual_count = self.num_groups * self.prompts_per_group
+            if expected_count_raw is None:
+                raise ValueError(
+                    f"{GSP_EXPECTED_REQUESTS_ENV} is required for sharded GSP data"
+                )
+            if actual_count != int(expected_count_raw):
+                raise ValueError(
+                    "GSP dataset size does not match the multiprocess launcher: "
+                    f"configured {actual_count}, expected {expected_count_raw}"
+                )
         return sample_generated_shared_prefix_requests(
             num_groups=self.num_groups,
             prompts_per_group=self.prompts_per_group,
@@ -117,6 +157,8 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             ordered=self.ordered,
             group_distribution=self.group_distribution,
             zipf_alpha=self.zipf_alpha,
+            shard_count=shard[0] if shard is not None else None,
+            shard_index=shard[1] if shard is not None else None,
         )
 
 
@@ -130,6 +172,10 @@ def get_gen_prefix_cache_path(
     tokenizer,
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
+    shard_count: Optional[int] = None,
+    shard_index: Optional[int] = None,
+    fast_prepare: bool = False,
+    ordered: bool = False,
 ):
     """Create cache directory under ~/.cache/sglang/benchmark.
 
@@ -142,6 +188,19 @@ def get_gen_prefix_cache_path(
     suffix = ""
     if group_distribution != "uniform":
         suffix = f"_{group_distribution}_{zipf_alpha}"
+    if (shard_count is None) != (shard_index is None):
+        raise ValueError("shard_count and shard_index must be set together")
+    if shard_count is not None:
+        if shard_count <= 0 or not 0 <= shard_index < shard_count:
+            raise ValueError(
+                f"Invalid GSP cache shard: index={shard_index}, count={shard_count}"
+            )
+        suffix += (
+            f"_mpv{GSP_SHARD_CACHE_VERSION}"
+            f"_shard_{shard_index}_of_{shard_count}"
+            f"_fast_{int(fast_prepare)}"
+            f"_ordered_{int(ordered)}"
+        )
 
     cache_key = (
         f"gen_shared_prefix_{seed}_{num_groups}_{prompts_per_group}_"
@@ -149,6 +208,218 @@ def get_gen_prefix_cache_path(
         f"{tokenizer.__class__.__name__}.pkl"
     )
     return cache_dir / cache_key
+
+
+def _derive_seed(seed: int, *parts: object) -> int:
+    # Component seeds make every global slot reproducible without generating
+    # and discarding the slots owned by other worker processes.
+    material = ":".join([str(seed), *(str(part) for part in parts)]).encode()
+    return int.from_bytes(
+        hashlib.blake2b(material, digest_size=8).digest(), byteorder="big"
+    )
+
+
+def _compute_deterministic_lens(
+    full_len: int, range_ratio: float, num: int, seed: int
+) -> List[int]:
+    if full_len <= 0:
+        return [0] * num
+    rng = np.random.default_rng(seed)
+    return rng.integers(
+        max(int(full_len * range_ratio), 1),
+        full_len + 1,
+        size=num,
+    ).tolist()
+
+
+def _gen_prompt_with_seed(
+    tokenizer: PreTrainedTokenizerBase, token_num: int, seed: int
+) -> str:
+    available_tokens = get_available_tokens(tokenizer)
+    selected_tokens = random.Random(seed).choices(available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def _sample_generated_shared_prefix_shard(
+    *,
+    num_groups: int,
+    prompts_per_group: int,
+    system_prompt_len: int,
+    question_len: int,
+    output_len: int,
+    range_ratio: float,
+    tokenizer: PreTrainedTokenizerBase,
+    seed: int,
+    send_routing_key: bool,
+    num_turns: int,
+    fast_prepare: bool,
+    ordered: bool,
+    group_distribution: str,
+    zipf_alpha: Optional[float],
+    shard_count: int,
+    shard_index: int,
+) -> List[DatasetRow]:
+    total_slots = num_groups * prompts_per_group
+    if shard_count <= 0 or not 0 <= shard_index < shard_count:
+        raise ValueError(
+            f"Invalid GSP benchmark shard: index={shard_index}, count={shard_count}"
+        )
+
+    cache_path = get_gen_prefix_cache_path(
+        seed,
+        num_groups,
+        prompts_per_group,
+        system_prompt_len,
+        question_len,
+        output_len,
+        tokenizer,
+        group_distribution=group_distribution,
+        zipf_alpha=zipf_alpha,
+        shard_count=shard_count,
+        shard_index=shard_index,
+        fast_prepare=fast_prepare,
+        ordered=ordered,
+    )
+    should_cache = range_ratio == 1 and not send_routing_key and num_turns == 1
+    if should_cache and cache_path.exists():
+        print(f"\nLoading cached generated input shard from {cache_path}")
+        with open(cache_path, "rb") as f:
+            rows = pickle.load(f)
+        expected_shard_size = len(range(shard_index, total_slots, shard_count))
+        if len(rows) != expected_shard_size:
+            raise ValueError(
+                f"Cached GSP shard {shard_index}/{shard_count} has {len(rows)} "
+                f"rows, expected {expected_shard_size}: {cache_path}"
+            )
+        return rows
+
+    if not should_cache:
+        print(f"\nCache bypassed ({range_ratio=}, {send_routing_key=}, {num_turns=})")
+
+    # Shuffle globally before striding so interleaving all worker shards
+    # reconstructs the exact shard_count=1 request sequence.
+    global_slots = list(range(total_slots))
+    if not ordered:
+        random.Random(_derive_seed(seed, "shuffle")).shuffle(global_slots)
+    shard_slots = global_slots[shard_index::shard_count]
+    print(
+        "\nGenerating new input shard... "
+        f"(shard={shard_index}/{shard_count}, shard_size={len(shard_slots)}, "
+        f"total_slots={total_slots}, {num_groups=}, {prompts_per_group=}, "
+        f"{system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=}, "
+        f"{num_turns=}, {group_distribution=}, {zipf_alpha=})"
+    )
+
+    system_prompt_lens = _compute_deterministic_lens(
+        system_prompt_len,
+        range_ratio,
+        num_groups,
+        _derive_seed(seed, "system_lens"),
+    )
+    question_lens = np.array(
+        _compute_deterministic_lens(
+            question_len,
+            range_ratio,
+            total_slots * num_turns,
+            _derive_seed(seed, "question_lens"),
+        )
+    ).reshape(total_slots, num_turns)
+    output_lens = _compute_deterministic_lens(
+        output_len,
+        range_ratio,
+        total_slots,
+        _derive_seed(seed, "output_lens"),
+    )
+
+    if group_distribution == "uniform":
+        assignment = np.repeat(np.arange(num_groups), prompts_per_group)
+    else:
+        rng = np.random.default_rng(seed)
+        probs = _zipf_group_probs(num_groups, zipf_alpha)
+        assignment = rng.choice(num_groups, size=total_slots, replace=True, p=probs)
+
+    # Every worker derives shared prefixes from the same group seed, while only
+    # materializing groups and questions referenced by its own slots.
+    used_groups = {int(assignment[slot_idx]) for slot_idx in shard_slots}
+    system_prompts = {
+        group_index: _gen_prompt_with_seed(
+            tokenizer,
+            system_prompt_lens[group_index],
+            _derive_seed(seed, "system_prompt", group_index),
+        )
+        for group_index in used_groups
+    }
+
+    run_random_str = os.getenv("SGLANG_BENCH_GSP_RUN_ID") or uuid.uuid4().hex[:8]
+    run_start_timestamp = os.getenv(
+        "SGLANG_BENCH_GSP_RUN_TIMESTAMP"
+    ) or datetime.now().strftime("%Y%m%d%H%M%S")
+
+    input_requests = []
+    total_input_tokens = 0
+    total_output_tokens = 0
+    for slot_idx in tqdm(
+        shard_slots,
+        desc=f"Generating shared-prefix shard {shard_index}/{shard_count}",
+    ):
+        sampled_group = int(assignment[slot_idx])
+        turn_questions = [
+            _gen_prompt_with_seed(
+                tokenizer,
+                int(question_lens[slot_idx, turn_index]),
+                _derive_seed(seed, "question", slot_idx, turn_index),
+            )
+            for turn_index in range(num_turns)
+        ]
+        turn_prompts = [
+            f"{system_prompts[sampled_group]}\n\n{turn_questions[0]}"
+        ] + turn_questions[1:]
+        full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
+        prompt_len = 1 if fast_prepare else len(tokenizer.encode(turn_prompts[0]))
+        output_len_val = int(output_lens[slot_idx])
+        routing_key = (
+            f"{run_random_str}_{run_start_timestamp}_{sampled_group}"
+            if send_routing_key
+            else None
+        )
+
+        input_requests.append(
+            DatasetRow(
+                prompt=full_prompt,
+                prompt_len=prompt_len,
+                output_len=output_len_val,
+                routing_key=routing_key,
+            )
+        )
+        total_input_tokens += prompt_len
+        total_output_tokens += output_len_val
+
+    print("\nGenerated shared prefix shard statistics:")
+    print(f"Shard: {shard_index}/{shard_count}")
+    print(f"Shard prompts: {len(input_requests)} of {total_slots}")
+    print(f"Number of groups represented: {len(used_groups)}")
+    print(f"Number of turns: {num_turns}")
+    print(f"Group distribution: {group_distribution}")
+    if group_distribution == "zipf":
+        print(f"Zipf alpha: {zipf_alpha}")
+    if not fast_prepare:
+        print(f"Total input tokens: {total_input_tokens}")
+        print(f"Total output tokens: {total_output_tokens}")
+
+    if should_cache:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Caching generated input shard to {cache_path}")
+        temp_cache_path = cache_path.with_name(
+            f".{cache_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with open(temp_cache_path, "wb") as f:
+                pickle.dump(input_requests, f)
+            os.replace(temp_cache_path, cache_path)
+        finally:
+            temp_cache_path.unlink(missing_ok=True)
+
+    return input_requests
 
 
 def sample_generated_shared_prefix_requests(
@@ -166,6 +437,8 @@ def sample_generated_shared_prefix_requests(
     ordered: bool = False,
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
+    shard_count: Optional[int] = None,
+    shard_index: Optional[int] = None,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching.
 
@@ -179,7 +452,33 @@ def sample_generated_shared_prefix_requests(
     stays byte-identical to uniform mode for the same seed and other args.
     Zipf mode is cached on disk under a distinct key per (group_distribution,
     zipf_alpha) value.
+
+    When shard_count and shard_index are set by the multiprocess launcher, only
+    that worker's global slots are generated and cached. Combining all shards in
+    stride order is identical to the shard_count=1 path.
     """
+    if (shard_count is None) != (shard_index is None):
+        raise ValueError("shard_count and shard_index must be set together")
+    if shard_count is not None:
+        return _sample_generated_shared_prefix_shard(
+            num_groups=num_groups,
+            prompts_per_group=prompts_per_group,
+            system_prompt_len=system_prompt_len,
+            question_len=question_len,
+            output_len=output_len,
+            range_ratio=range_ratio,
+            tokenizer=tokenizer,
+            seed=seed,
+            send_routing_key=send_routing_key,
+            num_turns=num_turns,
+            fast_prepare=fast_prepare,
+            ordered=ordered,
+            group_distribution=group_distribution,
+            zipf_alpha=zipf_alpha,
+            shard_count=shard_count,
+            shard_index=shard_index,
+        )
+
     cache_path = get_gen_prefix_cache_path(
         seed,
         num_groups,
@@ -209,8 +508,10 @@ def sample_generated_shared_prefix_requests(
         f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=}, {num_turns=}, {group_distribution=}, {zipf_alpha=})"
     )
 
-    run_random_str = uuid.uuid4().hex[:8]
-    run_start_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    run_random_str = os.getenv("SGLANG_BENCH_GSP_RUN_ID") or uuid.uuid4().hex[:8]
+    run_start_timestamp = os.getenv(
+        "SGLANG_BENCH_GSP_RUN_TIMESTAMP"
+    ) or datetime.now().strftime("%Y%m%d%H%M%S")
 
     system_prompt_lens = compute_random_lens(
         full_len=system_prompt_len,
@@ -322,7 +623,14 @@ def sample_generated_shared_prefix_requests(
     if should_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Caching generated input data to {cache_path}")
-        with open(cache_path, "wb") as f:
-            pickle.dump(input_requests, f)
+        temp_cache_path = cache_path.with_name(
+            f".{cache_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with open(temp_cache_path, "wb") as f:
+                pickle.dump(input_requests, f)
+            os.replace(temp_cache_path, cache_path)
+        finally:
+            temp_cache_path.unlink(missing_ok=True)
 
     return input_requests
