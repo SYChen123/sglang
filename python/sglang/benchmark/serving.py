@@ -2081,7 +2081,11 @@ async def benchmark(
             output.itl if output.success else [] for output in outputs
         ]
         result_details["_retokenized_metric_itls"] = [
-            (_get_metric_itls(output, tokenizer, True) if output.success else [])
+            (
+                _get_metric_itls(output, tokenizer, True)
+                if output.success and use_retokenized_metric_itl
+                else (output.itl if output.success else [])
+            )
             for output in outputs
         ]
     elif use_retokenized_metric_itl:
