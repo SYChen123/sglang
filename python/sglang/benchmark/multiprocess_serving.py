@@ -44,7 +44,6 @@ _PARENT_VALUE_OPTIONS = {
     "--warmup-requests",
 }
 _PARENT_FLAG_OPTIONS = {
-    "--disable-tqdm",
     "--flush-cache",
     "--output-details",
     "--prepare-only",
@@ -188,7 +187,6 @@ def _build_worker_command(
         *_strip_parent_options(benchmark_args),
         "--num-prompts",
         str(total_num_prompts),
-        "--disable-tqdm",
     ]
     if prepare_only:
         command.append("--prepare-only")
