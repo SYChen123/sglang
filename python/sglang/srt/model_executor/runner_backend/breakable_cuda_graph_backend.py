@@ -114,6 +114,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         forward_fn: Callable[[], Any],
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
+        output_buffer_size: Optional[int] = None,
     ) -> None:
         warmup_out = None
         for _ in range(2):
@@ -128,7 +129,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
-        size = shape_key.size
+        size = shape_key.size if output_buffer_size is None else output_buffer_size
         if self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
         with (

@@ -1,7 +1,7 @@
 """B200 extra CI: DeepSeek-V4-Flash FP4 with attn-CP.
 
-Balanced recipe (TP=4, DeepEP, EAGLE) plus --attn-cp-size=4 with the
-DSA prefill-CP interleave strategy. Split out of
+Includes interleave coverage for the existing DSA prefill-CP paths and a
+zigzag + breakable-CUDA-graph + context-bucket MegaMoE recipe. Split out of
 e2e/models/test_deepseek_v4_flash_fp4_b200.py so the `cp` group covers
 all context-parallel tests.
 
@@ -101,7 +101,7 @@ class TestDSV4FlashFP4B200Balanced_CP_Megamoe(
     GSM8KMixin,
     CustomTestCase,
 ):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+    """TP=CP=EP=4, zigzag CP, context-bucket BCG, and MegaMoE."""
 
     gsm8k_accuracy_thres = 0.93
 
@@ -133,7 +133,16 @@ class TestDSV4FlashFP4B200Balanced_CP_Megamoe(
                 "2",
                 "--enable-prefill-cp",
                 "--cp-strategy",
-                "interleave",
+                "zigzag",
+                "--cuda-graph-backend-prefill",
+                "breakable",
+                "--cuda-graph-bs-prefill",
+                "256",
+                "1024",
+                "--cuda-graph-prefill-context-bucket",
+                "4096",
+                "--chunked-prefill-size",
+                "4096",
                 "--deepep-config",
                 DEEPEP_CONFIG,
             ],

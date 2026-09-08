@@ -288,11 +288,15 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             "KDA hybrid linear attention",
             lambda: uses_kda_attention(model_config_of(server_args).hf_config),
         ),
-        # DSV4 is BCG-compatible but introduces heavy memory pressure: the
-        # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
+        # Generic DSV4 BCG pins large c4 indexer scratch in the capture pool.
+        # The supported CP path keeps the whole attention sublayer eager, so
+        # those dynamic workspaces are no longer graph-pool allocations.
         (
             "DeepSeek-V4 (heavy capture-pool memory pressure)",
-            lambda: is_deepseek_v4(model_config_of(server_args).hf_config),
+            lambda: (
+                is_deepseek_v4(model_config_of(server_args).hf_config)
+                and not supports_prefill_cp_bcg(server_args)
+            ),
         ),
         # CP all_gather replay size mismatch under BCG.
         (

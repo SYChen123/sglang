@@ -173,6 +173,20 @@ class ContextParallelStrategy(ABC):
             f"{self.name} strategy does not support DSA trtllm FP8 KV gather"
         )
 
+    def local_token_indices(
+        self, forward_batch: ForwardBatch, padded_num_tokens: int
+    ) -> Any:
+        """Indices selecting this rank's physical query rows from global metadata."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not support attention metadata reindexing"
+        )
+
+    def layout_all_ranks(self, x: Any, forward_batch: ForwardBatch) -> Any:
+        """Lay out all CP shards rank-major for an all-gathered MoE input."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not support rank-major token layout"
+        )
+
     def split_before_forward(
         self,
         forward_batch: ForwardBatch,
@@ -222,9 +236,19 @@ class ContextParallelStrategy(ABC):
     ) -> Any:
         """Materialize full-layout MLA K/V for the strategy."""
 
-    def reindex_attn_metadata(self, core_attn_metadata: Any) -> None:
-        """Optional attention metadata rewrite for strategies that need it."""
-        return None
+    def reindex_attn_metadata(
+        self,
+        core_attn_metadata: Any,
+        forward_batch: ForwardBatch,
+        num_tokens: Optional[int] = None,
+    ) -> None:
+        """Rewrite query metadata to this rank's physical CP token layout."""
+        indices = self.local_token_indices(
+            forward_batch, core_attn_metadata.seq_lens_casual.shape[0]
+        )
+        core_attn_metadata.apply_cp_reindex(
+            num_tokens=num_tokens, token_indices=indices
+        )
 
 
 def _is_dsa_active() -> bool:

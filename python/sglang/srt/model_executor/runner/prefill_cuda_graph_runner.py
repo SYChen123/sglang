@@ -523,28 +523,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     for name in _PREFILL_STATIC_FIELDS
                 }
 
-        server_args = model_runner.server_args
-        self.enable_cp_bcg_capture = isinstance(
-            self.backend, BreakableCudaGraphBackend
-        ) and should_enable_cp_bcg_capture(server_args)
-        if self.enable_cp_bcg_capture:
-            if self.max_context_size is not None:
-                # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
-                # metadata preparation before enabling the fixed context limit.
-                self._ignore_max_context_size("CP breakable prefill CUDA graph")
-            self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
-                self.capture_num_tokens, server_args
-            )
-            self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
-        if self.max_context_size is not None and not (
-            model_runner.attn_backend.supports_prefill_cuda_graph_max_context_size
-        ):
-            raise ValueError(
-                "--cuda-graph-prefill-max-context is only supported by attention "
-                "backends that implement fixed-context prefill graph metadata; "
-                f"got {type(model_runner.attn_backend).__name__}"
-            )
-
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
         # Draft consumes aux-concatenated hidden states from the target
@@ -561,6 +539,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     (self.max_num_tokens, hidden_dim),
                     dtype=model_runner.dtype,
                 )
+
+        server_args = model_runner.server_args
+        self.enable_cp_bcg_capture = isinstance(
+            self.backend, BreakableCudaGraphBackend
+        ) and should_enable_cp_bcg_capture(server_args)
+        if self.enable_cp_bcg_capture:
+            self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
+                self.capture_num_tokens, server_args
+            )
+            self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+        if self.max_context_size is not None and not (
+            model_runner.attn_backend.supports_prefill_cuda_graph_max_context_size
+        ):
+            raise ValueError(
+                "--cuda-graph-prefill-max-context is only supported by attention "
+                "backends that implement fixed-context prefill graph metadata; "
+                f"got {type(model_runner.attn_backend).__name__}"
+            )
 
         # Some attention backends (e.g. DSV4) opt into a captured-metadata
         # contract under BCG: capture-time builds a per-bucket metadata
@@ -1137,7 +1133,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             )
             assert self.attn_metadata_buffers is not None
-            self.attn_metadata_buffers[shape_key] = metadata
+            # Backends whose whole CP attention sublayer is a BCG eager island
+            # rebuild live metadata at replay. Retaining one large captured
+            # metadata object per (G, K) would only waste memory.
+            self.attn_metadata_buffers[shape_key] = (
+                None
+                if self.enable_cp_bcg_capture
+                and attn_backend.rebuilds_cp_bcg_metadata_at_replay
+                else metadata
+            )
 
     def _prepare_forward_metadata_for_replay(
         self,
@@ -1347,13 +1351,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         context_length = min(
             self.max_context_size or model_context_length, model_context_length
         )
-        # A prefill bucket is an aggregate token count. Capture it as the
-        # fewest synthetic requests, with every request containing no more
-        # than context_length tokens.
-        capture_seq_lens = [
-            min(context_length, num_tokens - start)
-            for start in range(0, num_tokens, context_length)
-        ]
+        if self.enable_cp_bcg_capture:
+            # The CP input owns a canonical request layout for each token bucket,
+            # bounded by the configured fixed maximum context size.
+            capture_seq_lens = list(
+                self.prefill_cp_bcg_input.capture_seq_lens(num_tokens)
+            )
+            assert max(capture_seq_lens) <= context_length
+        else:
+            # A prefill bucket is an aggregate token count. Capture it as the
+            # fewest synthetic requests, with every request containing no more
+            # than context_length tokens.
+            capture_seq_lens = [
+                min(context_length, num_tokens - start)
+                for start in range(0, num_tokens, context_length)
+            ]
         if self.prefill_backend_name == Backend.FULL:
             # Full captures a fixed request-axis shape; unused slots are
             # zero-length sentinels after the context-bounded real requests.
@@ -1596,8 +1608,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # corrupt warmup iter 2's metadata read.
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
+            backend_capture_kwargs = {
+                "output_buffer_size": (
+                    self.prefill_cp_bcg_input.max_local_tokens
+                    if self.enable_cp_bcg_capture
+                    else None
+                )
+            }
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
+            backend_capture_kwargs = {}
         self.backend.capture_one(
             shape_key,
             run_once,
@@ -1609,6 +1629,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 else None
             ),
             post_warmup_hook=post_warmup_hook,
+            **backend_capture_kwargs,
         )
 
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
@@ -2016,15 +2037,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
             if self.enable_cp_bcg_capture:
-                assert self.max_context_size is None, (
-                    "CP-v2 BCG replay does not support a fixed prefill context size"
-                )
                 output = execute_prefill_cp_bcg(
                     self,
                     forward_batch,
                     static_forward_batch,
                     static_num_tokens,
                     raw_num_tokens,
+                    shape_key,
                     **kwargs,
                 )
             elif self._uses_eager_prefill_tail():

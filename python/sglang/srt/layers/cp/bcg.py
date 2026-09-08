@@ -17,12 +17,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
@@ -34,6 +35,7 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
@@ -41,6 +43,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
         PrefillCudaGraphRunner,
     )
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
     from sglang.srt.server_args import ServerArgs
 
 
@@ -50,12 +53,27 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
     prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
+    architectures = (
+        getattr(model_config_of(server_args).hf_config, "architectures", None) or ()
+    )
+    is_dsv4 = "DeepseekV4ForCausalLM" in architectures
+
+    # CUDA-graph compatibility runs before DSV4's model hook declares
+    # attn_cp_size=tp_size and before attention auto-detection fills "dsv4".
+    # Infer those two eventual values only for DSV4; explicit incompatible
+    # backends must still fail this predicate.
+    cp_topology_supported = cfg.dp_size == 1 and (
+        resolved.attn_cp_size == cfg.tp_size or is_dsv4
+    )
+    attention_backend_supported = prefill_attention_backend == "trtllm_mha" or (
+        is_dsv4 and prefill_attention_backend in (None, "dsv4")
+    )
     return (
         cfg.enable_prefill_cp
         and cfg.pp_size == 1
-        and resolved.attn_cp_size == cfg.tp_size
+        and cp_topology_supported
         and cfg.cp_strategy == "zigzag"
-        and prefill_attention_backend == "trtllm_mha"
+        and attention_backend_supported
     )
 
 
@@ -96,25 +114,137 @@ class PrefillCPBCGInput:
 
     input_embeds: torch.Tensor
     positions: torch.Tensor
+    moe_input_ids: Optional[torch.Tensor] = None
+    draft_hidden_states: Optional[torch.Tensor] = None
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
+    capture_seq_lens_by_bucket: Dict[int, Tuple[int, ...]] = field(default_factory=dict)
     live_local_tokens: int = 0
+
+    @staticmethod
+    def _build_capture_spec(
+        *,
+        num_tokens: int,
+        max_context_size: int,
+        max_bs: int,
+        cp_size: int,
+        align_size: int,
+    ) -> Tuple[Tuple[int, ...], int]:
+        """Return a stable request layout and its largest local CP shard.
+
+        Keeping the synthetic request layout fixed for a token bucket makes its
+        local graph extent stable while respecting the captured context limit.
+        """
+        if max_context_size <= 0:
+            raise ValueError(
+                f"CP BCG capture requires a positive context size, got {max_context_size}."
+            )
+
+        num_requests = (num_tokens + max_context_size - 1) // max_context_size
+        if num_requests > max_bs:
+            raise ValueError(
+                f"CP BCG capture needs {num_requests} request slots for "
+                f"{num_tokens} tokens at context size {max_context_size}, but the "
+                f"request pool has only {max_bs}."
+            )
+
+        base, remainder = divmod(num_tokens, num_requests)
+        seq_lens = tuple(
+            base + int(request_id < remainder) for request_id in range(num_requests)
+        )
+        min_zigzag_tokens = cp_size * 2
+        if min(seq_lens) < min_zigzag_tokens:
+            raise ValueError(
+                "CP BCG cannot build a context-bounded zigzag capture layout: "
+                f"num_tokens={num_tokens}, max_context_size={max_context_size}, "
+                f"smallest_request={min(seq_lens)}, required_per_request="
+                f"{min_zigzag_tokens}."
+            )
+
+        per_rank_tokens = [0] * cp_size
+        segment_count = cp_size * 2
+        for seq_len in seq_lens:
+            block_size, extra_blocks = divmod(seq_len, segment_count)
+            for rank in range(cp_size):
+                opposite_rank = segment_count - 1 - rank
+                per_rank_tokens[rank] += (
+                    block_size * 2
+                    + int(rank < extra_blocks)
+                    + int(opposite_rank < extra_blocks)
+                )
+        local_tokens = (
+            (max(per_rank_tokens) + align_size - 1) // align_size * align_size
+        )
+        return seq_lens, local_tokens
 
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
+        strategy = get_cp_strategy()
+        if not isinstance(strategy, ZigzagCPStrategy):
+            raise RuntimeError("CP BCG input creation requires the zigzag strategy.")
+
+        max_context_size = (
+            runner.max_context_size or runner.model_runner.model_config.context_len
+        )
+        capture_seq_lens_by_bucket: Dict[int, Tuple[int, ...]] = {}
+        bucket_local_tokens: Dict[int, int] = {}
+        for num_tokens in runner.capture_num_tokens:
+            seq_lens, local_tokens = cls._build_capture_spec(
+                num_tokens=num_tokens,
+                max_context_size=max_context_size,
+                max_bs=runner.max_bs,
+                cp_size=strategy.cp_size,
+                align_size=get_cp_padding_align_size(),
+            )
+            capture_seq_lens_by_bucket[num_tokens] = seq_lens
+            bucket_local_tokens[num_tokens] = local_tokens
+        max_local_tokens = max(bucket_local_tokens.values())
+        moe_input_rows = max_local_tokens * (
+            1 if not get_moe_a2a_backend().is_none() else strategy.cp_size
+        )
+
         with torch.device(runner.device):
             return cls(
                 input_embeds=torch.zeros(
                     (
-                        runner.max_num_tokens,
+                        max_local_tokens,
                         runner.model_runner.model_config.hidden_size,
                     ),
                     dtype=runner.model_runner.dtype,
                 ),
                 positions=torch.zeros(
-                    (runner.max_num_tokens,),
+                    (max_local_tokens,),
                     dtype=torch.int64,
                 ),
+                moe_input_ids=torch.zeros(
+                    (moe_input_rows,),
+                    dtype=torch.int64,
+                ),
+                draft_hidden_states=(
+                    torch.zeros(
+                        (
+                            max_local_tokens,
+                            runner.static_draft_hidden_states.shape[1],
+                        ),
+                        dtype=runner.static_draft_hidden_states.dtype,
+                    )
+                    if runner.static_draft_hidden_states is not None
+                    else None
+                ),
+                bucket_local_tokens=bucket_local_tokens,
+                capture_seq_lens_by_bucket=capture_seq_lens_by_bucket,
             )
+
+    def capture_seq_lens(self, num_tokens: int) -> Tuple[int, ...]:
+        try:
+            return self.capture_seq_lens_by_bucket[num_tokens]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Missing CP BCG capture layout for token bucket {num_tokens}."
+            ) from exc
+
+    @property
+    def max_local_tokens(self) -> int:
+        return max(self.bucket_local_tokens.values())
 
     def required_local_tokens(self, extend_seq_lens: Any) -> Optional[int]:
         """Return the aligned CP-local rows required by a live zigzag layout."""
@@ -230,8 +360,19 @@ class PrefillCPBCGInput:
         live_local_tokens = int(local_input_embeds.shape[0])
 
         if capture:
+            expected_local_tokens = self.bucket_local_tokens.get(static_num_tokens)
+            if expected_local_tokens is not None and (
+                live_local_tokens != expected_local_tokens
+            ):
+                raise RuntimeError(
+                    "CP BCG capture layout changed local graph geometry: "
+                    f"global bucket {static_num_tokens} expected "
+                    f"C_G={expected_local_tokens}, got {live_local_tokens}."
+                )
             captured_local_tokens = live_local_tokens
-            self.bucket_local_tokens[static_num_tokens] = captured_local_tokens
+            self.bucket_local_tokens.setdefault(
+                static_num_tokens, captured_local_tokens
+            )
         else:
             assert captured_local_tokens is not None
             if live_local_tokens > captured_local_tokens:
@@ -255,6 +396,50 @@ class PrefillCPBCGInput:
         positions[:live_local_tokens].copy_(local_positions)
         forward_batch.input_embeds = input_embeds
         forward_batch.positions = positions
+
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        if self.draft_hidden_states is not None:
+            spec_info = getattr(forward_batch, "spec_info", None)
+            global_draft_hidden_states = getattr(spec_info, "hidden_states", None)
+            if global_draft_hidden_states is None:
+                raise RuntimeError(
+                    "CP BCG EAGLE draft capture requires spec_info.hidden_states."
+                )
+            if global_draft_hidden_states.shape[0] < raw_tokens:
+                raise RuntimeError(
+                    "CP BCG EAGLE draft hidden states have fewer global rows than "
+                    f"the live prefill batch: {global_draft_hidden_states.shape[0]} "
+                    f"< {raw_tokens}."
+                )
+
+            local_draft_hidden_states = strategy.shard_hidden_states(
+                global_draft_hidden_states[:raw_tokens], forward_batch
+            )
+            if local_draft_hidden_states.shape[0] != live_local_tokens:
+                raise RuntimeError(
+                    "CP BCG EAGLE draft hidden-state layout disagrees with the "
+                    f"embedding layout: {local_draft_hidden_states.shape[0]} != "
+                    f"{live_local_tokens}."
+                )
+            static_draft_hidden_states = self.draft_hidden_states[
+                :captured_local_tokens
+            ]
+            static_draft_hidden_states.zero_()
+            static_draft_hidden_states[:live_local_tokens].copy_(
+                local_draft_hidden_states
+            )
+            spec_info.hidden_states = static_draft_hidden_states
+
+        moe_input_ids = (
+            strategy.layout_all_ranks(global_input_ids, forward_batch)
+            if get_moe_a2a_backend().is_none()
+            else strategy.shard_hidden_states(global_input_ids, forward_batch)
+        )
+        assert self.moe_input_ids is not None
+        static_moe_input_ids = self.moe_input_ids[: moe_input_ids.shape[0]]
+        static_moe_input_ids.copy_(moe_input_ids)
+        forward_batch.input_ids_global = static_moe_input_ids
         self.live_local_tokens = live_local_tokens
 
 
@@ -264,15 +449,10 @@ def execute_prefill_cp_bcg(
     static_forward_batch: ForwardBatch,
     static_num_tokens: int,
     raw_num_tokens: int,
+    shape_key: ShapeKey,
     **kwargs,
 ):
     """Replay a CP-local body and run the global gather/logits tail eagerly."""
-    # Importing a runner submodule while server arguments are being resolved
-    # executes runner/__init__.py, which imports this module through the prefill
-    # runner. Defer the runtime-only dependency until runner initialization has
-    # completed to keep the server-argument compatibility check acyclic.
-    from sglang.srt.model_executor.runner.shape_key import ShapeKey
-
     cp_input = runner.prefill_cp_bcg_input
     assert cp_input is not None
     model = runner.model_runner.model
@@ -282,7 +462,7 @@ def execute_prefill_cp_bcg(
         raw_num_tokens=raw_num_tokens,
     ):
         local_output = runner.backend.replay(
-            ShapeKey(size=static_num_tokens),
+            shape_key,
             static_forward_batch,
             **kwargs,
         )
@@ -307,10 +487,33 @@ def execute_prefill_cp_bcg(
             static_forward_batch,
             torch.cuda.current_stream(),
         )
+        if aux_hidden_states is not None:
+            if torch.is_tensor(aux_hidden_states):
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states,
+                    static_forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            else:
+                aux_hidden_states = [
+                    cp_gather_after_forward(
+                        aux,
+                        static_forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    for aux in aux_hidden_states
+                ]
+
+        logits_kwargs = {}
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_before_norm = hidden_states
+            if aux_hidden_states is None:
+                logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
             aux_hidden_states,
+            **logits_kwargs,
         )

@@ -68,6 +68,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
+    is_cp_active,
 )
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
@@ -583,17 +584,20 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    global_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
-    if real_num_tokens == 0:
+    if global_num_tokens == 0:
         output.zero_()
         return
 
-    query = query[:real_num_tokens]
-    key_value = key_value[:real_num_tokens]
+    query_num_tokens = (
+        query.shape[0] if is_cp_active(forward_batch) else global_num_tokens
+    )
+    query = query[:query_num_tokens]
+    key_value = key_value[:global_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    forward_batch.out_cache_loc = original_out_cache_loc[:global_num_tokens]
 
     attn_backend = get_attn_backend()
     try:
@@ -610,17 +614,36 @@ def deepseek_v4_attention_with_output(
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert output[:real_num_tokens].numel() == ret.numel(), (
-        f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
+    assert output[:query_num_tokens].numel() == ret.numel(), (
+        f"Output tensor element mismatch: {output[:query_num_tokens].numel()} != {ret.numel()}"
     )
 
-    output[:real_num_tokens].view(ret.shape).copy_(ret)
+    output[:query_num_tokens].view(ret.shape).copy_(ret)
     return
 
 
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
 )
+
+
+def deepseek_v4_cp_attention(
+    attention: MQALayer,
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    x_quant,
+) -> torch.Tensor:
+    context = get_tc_piecewise_forward_context()
+    assert context is not None
+    return attention._forward_impl(
+        x=x,
+        positions=positions,
+        forward_batch=context.forward_batch,
+        x_quant=x_quant,
+    )
+
+
+bcg_deepseek_v4_cp_attention = eager_on_graph(True)(deepseek_v4_cp_attention)
 
 
 class MqaAttentionBase(nn.Module):
@@ -1595,6 +1618,17 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         x_quant=None,
     ) -> torch.Tensor:
+        if is_cp_active(forward_batch) and is_in_breakable_cuda_graph():
+            return bcg_deepseek_v4_cp_attention(self, x, positions, x_quant)
+        return self._forward_impl(x, positions, forward_batch, x_quant)
+
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        x_quant=None,
+    ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
 
@@ -1716,7 +1750,11 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if (
+                forward_batch.forward_mode.is_extend()
+                and is_in_breakable_cuda_graph()
+                and not is_cp_active(forward_batch)
+            ):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
@@ -3078,7 +3116,6 @@ class DeepseekV4Model(nn.Module):
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
-
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
@@ -3283,7 +3320,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors

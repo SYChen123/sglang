@@ -163,11 +163,18 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     if not cfg.enable_prefill_cp:
         return
 
-    if cfg.cp_strategy != "interleave":
+    if cfg.cp_strategy not in ("interleave", "zigzag"):
         raise ValueError(
-            f"DeepSeekV4 only supports interleave CP strategy, got {cfg.cp_strategy}"
+            "DeepSeekV4 CP strategy must be interleave or zigzag, "
+            f"got {cfg.cp_strategy}"
         )
 
+    if get_platform().is_hip or get_platform().is_npu:
+        if cfg.cp_strategy != "interleave":
+            raise ValueError(
+                "DeepSeekV4 zigzag CP is currently supported only by the generic "
+                "CUDA CP-v2 path. HIP and NPU require interleave."
+            )
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
@@ -183,9 +190,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         "validate_deepseek_v4_cp",
         attn_cp_size=cfg.tp_size // cfg.dp_size,
     )
-    assert cfg.dp_size == 1, (
-        "For round-robin split mode, dp attention is not supported."
-    )
+    assert cfg.dp_size == 1, "DeepSeekV4 prefill CP does not support DP attention."
     assert cfg.tp_size <= 8, (
         "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
     )

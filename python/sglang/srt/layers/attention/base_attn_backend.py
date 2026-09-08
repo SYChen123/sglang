@@ -154,6 +154,11 @@ class AttentionBackend(ABC):
     # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
     supports_prefill_cuda_graph_max_context_size: bool = False
 
+    # Some CP BCG paths put the entire attention sublayer behind an eager graph
+    # break. They may replace captured metadata with a freshly built live object
+    # at replay because no captured segment reads its tensor addresses.
+    rebuilds_cp_bcg_metadata_at_replay: bool = False
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
         Override only for audited deviations from this conservative default."""

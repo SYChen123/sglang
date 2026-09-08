@@ -166,6 +166,23 @@ def prepare_cp_forward(forward_batch) -> None:
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
 
+    # A2A MoE consumes this rank's CP-local rows directly. Its valid rows form
+    # one contiguous prefix [0, Lr), so teach top-k to mask the physical CP
+    # padding [Lr, C). The no-A2A path first gathers rank-major [real, pad]
+    # blocks; one scalar cannot describe those disjoint valid regions, and its
+    # normal fused-MoE path does not consume this mask.
+    if (
+        getattr(forward_batch, "num_token_non_padded", None) is not None
+        and not get_moe_a2a_backend().is_none()
+    ):
+        metadata = forward_batch.attn_cp_metadata
+        per_rank_logical_tokens = (
+            metadata.per_rank_logical_token or metadata.per_rank_actual_token
+        )
+        forward_batch.num_token_non_padded.fill_(
+            per_rank_logical_tokens[strategy.cp_rank]
+        )
+
     if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
@@ -212,13 +229,11 @@ def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
 
 def cp_interleave_input_ids(input_ids: Any, forward_batch):
     assert is_cp_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
     if not get_moe_a2a_backend().is_none():
-        return cp_shard_hidden_states(input_ids, forward_batch)
-
-    physical_tokens = sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
-    padded_input_ids = input_ids.new_zeros(physical_tokens)
-    padded_input_ids[: input_ids.shape[0]] = input_ids
-    return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()
+        return strategy.shard_hidden_states(input_ids, forward_batch)
+    return strategy.layout_all_ranks(input_ids, forward_batch)
 
 
 def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):

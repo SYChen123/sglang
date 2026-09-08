@@ -66,6 +66,7 @@ from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
 )
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -341,16 +342,28 @@ class DSV4AttnMetadata:
         "c128_out_loc",
     ]
 
-    def apply_cp_reindex(self, num_tokens: Optional[int] = None) -> None:
-        cp_rank = get_parallel().attn_cp_rank
-        cp_size = get_parallel().attn_cp_size
-        idx = slice(cp_rank, None, cp_size)
+    def apply_cp_reindex(
+        self,
+        num_tokens: Optional[int] = None,
+        token_indices: Optional[torch.Tensor] = None,
+    ) -> None:
         pre_global_len = self.seq_lens_casual.shape[0]
-        assert pre_global_len % cp_size == 0, (
-            f"apply_cp_reindex: global token count {pre_global_len} is not divisible by cp_size={cp_size}. "
-            "CP round-robin requires padding to ensure divisibility."
-        )
-        expected_local_len = pre_global_len // cp_size
+        if token_indices is None:
+            cp_rank = get_parallel().attn_cp_rank
+            cp_size = get_parallel().attn_cp_size
+            assert pre_global_len % cp_size == 0, (
+                f"apply_cp_reindex: global token count {pre_global_len} is not "
+                f"divisible by cp_size={cp_size}."
+            )
+            idx = slice(cp_rank, None, cp_size)
+            expected_local_len = pre_global_len // cp_size
+        else:
+            assert token_indices.ndim == 1
+            assert (
+                token_indices.numel() == 0 or int(token_indices.max()) < pre_global_len
+            )
+            idx = token_indices
+            expected_local_len = token_indices.numel()
         if num_tokens is None:
             num_tokens = pre_global_len
         for field_name in self._CP_REINDEX_FIELDS:
@@ -358,13 +371,17 @@ class DSV4AttnMetadata:
             assert isinstance(val, torch.Tensor), (
                 f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             )
-            setattr(self, field_name, val[idx].contiguous())
+            if token_indices is not None:
+                reindexed = val.index_select(0, token_indices.to(val.device))
+            else:
+                reindexed = val[idx]
+            setattr(self, field_name, reindexed.contiguous())
 
         for field_name in self._CP_REINDEX_FIELDS:
             val = getattr(self, field_name)
             assert val.shape[0] == expected_local_len, (
                 f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
-                f"!= expected_local_len={expected_local_len} (cp_size={cp_size})"
+                f"!= expected_local_len={expected_local_len}"
             )
         for field_name in self._CP_GLOBAL_FIELDS:
             val = getattr(self, field_name, None)
@@ -511,6 +528,7 @@ class DeepseekV4AttnBackend(
 ):
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_prefill_cuda_graph_max_context_size: bool = True
+    rebuilds_cp_bcg_metadata_at_replay: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
 
@@ -775,7 +793,11 @@ class DeepseekV4AttnBackend(
             num_tokens=num_tokens if cp_active else None,
         )
         if cp_active:
-            core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
+            strategy = get_cp_strategy()
+            assert strategy is not None
+            strategy.reindex_attn_metadata(
+                core_attn_metadata, forward_batch, num_tokens=num_tokens
+            )
             core_attn_metadata.init_flashmla_related(is_prefill=True)
         indexer_metadata = (
             self.init_forward_metadata_indexer(
@@ -1567,6 +1589,13 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        if is_cp_active(metadata_batch):
+            # DSV4 CP uses one eager attention island per layer under BCG. Its
+            # global compressor plans and cache-write locations vary with the
+            # live batch, so expose the freshly built metadata directly rather
+            # than forcing it into capture-time tensor shapes.
+            self.forward_metadata = static_metadata
+            return
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata

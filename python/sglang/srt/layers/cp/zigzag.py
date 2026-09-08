@@ -312,6 +312,87 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         local_positions = torch.cat([chunks[i] for i in metadata.zigzag_index], dim=-1)
         return pad_local_rows(local_positions, metadata, dim=-1)
 
+    @staticmethod
+    def _zigzag_index_for_rank(metadata, rank: int, cp_size: int) -> List[int]:
+        segment_count = cp_size * 2
+        return list(
+            range(rank, rank + metadata.bs * segment_count, segment_count)
+        ) + list(
+            range(
+                segment_count - rank - 1,
+                metadata.bs * segment_count,
+                segment_count,
+            )
+        )
+
+    def _logical_token_indices(self, metadata, rank: int, device: Any) -> Any:
+        split_offsets = [0] + list(accumulate(metadata.split_list))
+        chunks = [
+            torch.arange(
+                split_offsets[index],
+                split_offsets[index + 1],
+                device=device,
+                dtype=torch.int64,
+            )
+            for index in self._zigzag_index_for_rank(metadata, rank, self.cp_size)
+            if split_offsets[index] != split_offsets[index + 1]
+        ]
+        if not chunks:
+            return torch.empty(0, device=device, dtype=torch.int64)
+        return torch.cat(chunks)
+
+    def local_token_indices(self, forward_batch, padded_num_tokens: int) -> Any:
+        metadata = forward_batch.attn_cp_metadata
+        device = forward_batch.positions.device
+        logical_indices = self._logical_token_indices(
+            metadata, self.cp_rank, device=device
+        )
+        logical_rank_tokens = (
+            metadata.per_rank_logical_token or metadata.per_rank_actual_token
+        )
+        physical_rank_tokens = metadata.per_rank_actual_token[self.cp_rank]
+        pad_tokens = physical_rank_tokens - logical_indices.numel()
+        assert pad_tokens >= 0
+        padding_before_rank = sum(
+            metadata.per_rank_actual_token[rank] - logical_rank_tokens[rank]
+            for rank in range(self.cp_rank)
+        )
+        padding_start = metadata.total_seq_lens + padding_before_rank
+        padding_indices = torch.arange(
+            padding_start,
+            padding_start + pad_tokens,
+            device=device,
+            dtype=torch.int64,
+        )
+        indices = torch.cat((logical_indices, padding_indices))
+        assert indices.numel() == physical_rank_tokens
+        assert indices.numel() == 0 or int(indices.max()) < padded_num_tokens
+        return indices
+
+    def layout_all_ranks(self, x: Any, forward_batch) -> Any:
+        metadata = forward_batch.attn_cp_metadata
+        x = x[: metadata.total_seq_lens]
+        chunks = torch.split(x, metadata.split_list, dim=0)
+        physical_rank_tokens = metadata.per_rank_actual_token[0]
+        rank_shards = []
+        for rank in range(self.cp_size):
+            local = torch.cat(
+                [
+                    chunks[index]
+                    for index in self._zigzag_index_for_rank(
+                        metadata, rank, self.cp_size
+                    )
+                ],
+                dim=0,
+            )
+            pad_tokens = physical_rank_tokens - local.shape[0]
+            if pad_tokens > 0:
+                local = torch.cat(
+                    [local, local.new_zeros((pad_tokens, *local.shape[1:]))], dim=0
+                )
+            rank_shards.append(local)
+        return torch.cat(rank_shards, dim=0)
+
     def gather_hidden_states(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
@@ -337,8 +418,24 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def get_supported_attention_backend(self):
         return [
             CPAttentionBackendKind.FLASH_ATTENTION,
+            CPAttentionBackendKind.DSA,
             CPAttentionBackendKind.TRTLLM_MHA,
         ]
+
+    def materialize_full_indexer_k_cache(self, key: Any, forward_batch) -> Any:
+        return self.gather_kv_cache(
+            key.contiguous(), forward_batch, torch.cuda.current_stream()
+        )
+
+    def all_gather_dsa_trtllm_fp8_kv(self, forward_batch, k: Any, k_rope: Any) -> Any:
+        kv_lora_rank = k.shape[-1]
+        qk_rope_head_dim = k_rope.shape[-1]
+        kv_dtype = k.dtype
+        kv = torch.cat((k, k_rope), dim=-1).view(torch.uint8)
+        kv = self.gather_kv_cache(
+            kv.contiguous(), forward_batch, torch.cuda.current_stream()
+        ).view(kv_dtype)
+        return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
 
     def run_attention(
         self,

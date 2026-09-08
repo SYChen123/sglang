@@ -15,7 +15,7 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
-from sglang.srt.layers.cp.bcg import PrefillCPBCGInput
+from sglang.srt.layers.cp.bcg import PrefillCPBCGInput, supports_prefill_cp_bcg
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import (
     get_cp_padding_align_size,
@@ -98,6 +98,22 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
+    def test_cp_v2_strategy_controls_padding_alignment(self):
+        with get_parallel().override(attn_cp_size=4):
+            init_cp_strategy(
+                enable_prefill_cp=True,
+                cp_size=4,
+                cp_strategy="zigzag",
+            )
+            self.assertEqual(get_cp_padding_align_size(), 8)
+
+            init_cp_strategy(
+                enable_prefill_cp=True,
+                cp_size=4,
+                cp_strategy="interleave",
+            )
+            self.assertEqual(get_cp_padding_align_size(), 4)
+
     def test_hip_dsa_cp_is_disabled(self):
         parallel = SimpleNamespace(
             attn_cp_size=2,
@@ -162,6 +178,90 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             cp_size=4,
             cp_strategy="zigzag",
         )
+
+    def test_dsv4_support_is_visible_before_model_specific_resolution(self):
+        args = object()
+        resolving = SimpleNamespace(
+            enable_prefill_cp=True,
+            pp_size=1,
+            tp_size=8,
+            dp_size=1,
+            cp_strategy="zigzag",
+        )
+        resolved = SimpleNamespace(attn_cp_size=1)
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        )
+
+        with (
+            patch("sglang.srt.layers.cp.bcg.resolving_view", return_value=resolving),
+            patch("sglang.srt.layers.cp.bcg.resolved_view", return_value=resolved),
+            patch(
+                "sglang.srt.layers.cp.bcg.attention_backends_of",
+                return_value=(None, None),
+            ),
+            patch(
+                "sglang.srt.layers.cp.bcg.model_config_of",
+                return_value=model_config,
+            ),
+        ):
+            self.assertTrue(supports_prefill_cp_bcg(args))
+
+            resolving.dp_size = 2
+            self.assertFalse(supports_prefill_cp_bcg(args))
+
+            resolving.dp_size = 1
+            with patch(
+                "sglang.srt.layers.cp.bcg.attention_backends_of",
+                return_value=("flashinfer", None),
+            ):
+                self.assertFalse(supports_prefill_cp_bcg(args))
+
+    def test_capture_spec_respects_fixed_context_limit(self):
+        seq_lens, local_tokens = PrefillCPBCGInput._build_capture_spec(
+            num_tokens=2048,
+            max_context_size=1024,
+            max_bs=8,
+            cp_size=4,
+            align_size=8,
+        )
+
+        self.assertEqual(seq_lens, (1024, 1024))
+        self.assertEqual(local_tokens, 512)
+
+    def test_context_limit_is_not_a_third_cp_graph_axis(self):
+        runner = self._make_runner()
+        runner.max_context_size = 1024
+        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+            input_embeds=torch.empty(0),
+            positions=torch.empty(0),
+            bucket_local_tokens={2048: 512},
+            capture_seq_lens_by_bucket={2048: (1024, 1024)},
+        )
+
+        short_context = self._make_forward_batch()
+        short_context.seq_lens_cpu = [900, 161, 353]
+        long_context = self._make_forward_batch()
+
+        short_key = runner._shape_key(2048, short_context)
+        long_key = runner._shape_key(2048, long_context)
+
+        self.assertEqual(short_key, long_key)
+        self.assertEqual(short_key.size, 2048)
+        self.assertEqual(
+            runner.prefill_cp_bcg_input.capture_seq_lens(2048), (1024, 1024)
+        )
+        self.assertEqual(runner.prefill_cp_bcg_input.bucket_local_tokens[2048], 512)
+
+    def test_capture_spec_rejects_context_layout_incompatible_with_zigzag(self):
+        with self.assertRaisesRegex(ValueError, "required_per_request=16"):
+            PrefillCPBCGInput._build_capture_spec(
+                num_tokens=17,
+                max_context_size=16,
+                max_bs=8,
+                cp_size=8,
+                align_size=16,
+            )
 
     def test_local_capacity_overflow_uses_next_capture_bucket(self):
         runner = self._make_runner()
@@ -233,6 +333,79 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         ):
             self.assertFalse(runner.can_run_graph(forward_batch))
 
+    def test_prepare_shards_eagle_draft_hidden_states_like_embeddings(self):
+        class FakeModel:
+            @staticmethod
+            def get_input_embeddings():
+                return lambda token_ids: torch.stack(
+                    (token_ids.float(), token_ids.float() + 100), dim=1
+                )
+
+        no_a2a = SimpleNamespace(is_none=lambda: True)
+        runner = SimpleNamespace(
+            model_runner=SimpleNamespace(model=FakeModel()),
+        )
+        cp_input = PrefillCPBCGInput(
+            input_embeds=torch.empty((8, 2)),
+            positions=torch.empty((8,), dtype=torch.int64),
+            moe_input_ids=torch.empty((32,), dtype=torch.int64),
+            draft_hidden_states=torch.empty((8, 3)),
+            bucket_local_tokens={16: 8},
+        )
+        global_draft_hidden_states = torch.arange(48).view(16, 3).float()
+        forward_batch = SimpleNamespace(
+            forward_mode=_ExtendMode(),
+            input_ids=torch.arange(16),
+            positions=torch.arange(16),
+            extend_num_tokens=16,
+            seq_lens_cpu=[16],
+            extend_seq_lens_cpu=[16],
+            attn_cp_metadata=None,
+            out_cache_loc=None,
+            global_num_tokens_cpu=None,
+            num_token_non_padded=None,
+            spec_info=SimpleNamespace(hidden_states=global_draft_hidden_states),
+        )
+        self._enable_zigzag()
+
+        with (
+            get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
+            patch("sglang.srt.layers.cp.bcg.get_moe_a2a_backend", return_value=no_a2a),
+            patch(
+                "sglang.srt.layers.cp.utils.get_moe_a2a_backend",
+                return_value=no_a2a,
+            ),
+        ):
+            cp_input.prepare(
+                runner,
+                forward_batch,
+                static_num_tokens=16,
+                capture=True,
+            )
+
+        expected_rows = torch.tensor([0, 1, 14, 15])
+        self.assertTrue(
+            torch.equal(
+                forward_batch.spec_info.hidden_states[:4],
+                global_draft_hidden_states[expected_rows],
+            )
+        )
+        self.assertTrue(
+            torch.count_nonzero(forward_batch.spec_info.hidden_states[4:]) == 0
+        )
+        self.assertEqual(
+            forward_batch.spec_info.hidden_states.shape[0],
+            cp_input.input_embeds.shape[0],
+        )
+        self.assertTrue(
+            torch.equal(
+                forward_batch.input_ids_global,
+                torch.tensor(
+                    [0, 1, 14, 15, 2, 3, 12, 13, 4, 5, 10, 11, 6, 7, 8, 9]
+                ),
+            )
+        )
+
     def test_load_batch_uses_selected_larger_bucket(self):
         class StopAfterRecordingFill(Exception):
             pass
@@ -290,6 +463,7 @@ class TestCPZigzagStrategy(CustomTestCase):
     def _forward_batch(self, metadata, extend_seq_lens):
         return SimpleNamespace(
             input_ids=torch.arange(sum(extend_seq_lens)),
+            positions=torch.arange(sum(extend_seq_lens)),
             forward_mode=_ExtendMode(),
             extend_seq_lens_cpu=extend_seq_lens,
             attn_cp_metadata=metadata,
@@ -510,6 +684,152 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertTrue(torch.equal(local_positions, expected_positions))
             self.assertTrue(torch.equal(helper_x, expected_x))
             self.assertTrue(torch.equal(helper_positions, expected_positions))
+
+    def test_zigzag_reindex_uses_local_order_then_private_padding_rows(self):
+        cp_size = 4
+        seq_lens = [9, 10]
+        extend_seq_lens = [9, 10]
+        strategy = ZigzagCPStrategy(cp_size=cp_size)
+
+        for rank in range(cp_size):
+            with (
+                self.subTest(rank=rank),
+                get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size),
+                patch(
+                    "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                    return_value=8,
+                ),
+            ):
+                metadata = strategy.build_metadata(
+                    num_tokens=sum(extend_seq_lens),
+                    seqs_len=seq_lens,
+                    extend_seqs_len=extend_seq_lens,
+                )
+                pad_logical_token_to_physical(metadata)
+                forward_batch = self._forward_batch(metadata, extend_seq_lens)
+                padded_num_tokens = sum(metadata.per_rank_actual_token)
+                indices = strategy.local_token_indices(forward_batch, padded_num_tokens)
+                logical_tokens = metadata.per_rank_logical_token[rank]
+                expected_local = strategy.shard_hidden_states(
+                    torch.arange(sum(extend_seq_lens)), forward_batch
+                )[:logical_tokens]
+
+                self.assertTrue(torch.equal(indices[:logical_tokens], expected_local))
+                self.assertEqual(indices.numel(), metadata.per_rank_actual_token[rank])
+                self.assertTrue(
+                    torch.all(indices[logical_tokens:] >= sum(extend_seq_lens))
+                )
+                self.assertTrue(torch.all(indices < padded_num_tokens))
+
+    def test_zigzag_rank_major_layout_matches_all_padded_rank_shards(self):
+        cp_size = 4
+        extend_seq_lens = [9, 10]
+        strategy = ZigzagCPStrategy(cp_size=cp_size)
+        x = torch.arange(1, sum(extend_seq_lens) + 1)
+
+        with (
+            get_parallel().override(attn_cp_rank=0, attn_cp_size=cp_size),
+            patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                return_value=8,
+            ),
+        ):
+            metadata = strategy.build_metadata(
+                num_tokens=x.numel(),
+                seqs_len=extend_seq_lens,
+                extend_seqs_len=extend_seq_lens,
+            )
+            pad_logical_token_to_physical(metadata)
+            forward_batch = self._forward_batch(metadata, extend_seq_lens)
+            actual = strategy.layout_all_ranks(x, forward_batch)
+
+        chunks = torch.split(x, metadata.split_list)
+        expected_rank_shards = []
+        physical_rank_tokens = metadata.per_rank_actual_token[0]
+        for rank in range(cp_size):
+            local = torch.cat(
+                [
+                    chunks[index]
+                    for index in strategy._zigzag_index_for_rank(
+                        metadata, rank, cp_size
+                    )
+                ]
+            )
+            expected_rank_shards.append(
+                torch.nn.functional.pad(
+                    local, (0, physical_rank_tokens - local.numel())
+                )
+            )
+
+        self.assertTrue(torch.equal(actual, torch.cat(expected_rank_shards)))
+
+    def test_cp_a2a_masks_local_padding_with_rank_logical_token_count(self):
+        cp_size = 4
+        extend_seq_lens = [9, 10]
+
+        for rank in range(cp_size):
+            forward_batch = SimpleNamespace(
+                input_ids=torch.arange(sum(extend_seq_lens)),
+                forward_mode=_ExtendMode(),
+                seq_lens_cpu=extend_seq_lens,
+                extend_seq_lens_cpu=extend_seq_lens,
+                attn_cp_metadata=None,
+                num_token_non_padded=torch.tensor(
+                    [sum(extend_seq_lens)], dtype=torch.int32
+                ),
+                global_num_tokens_cpu=None,
+                out_cache_loc=None,
+            )
+            with (
+                self.subTest(rank=rank),
+                get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size),
+                patch(
+                    "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                    return_value=8,
+                ),
+                patch(
+                    "sglang.srt.layers.cp.utils.get_moe_a2a_backend",
+                    return_value=SimpleNamespace(is_none=lambda: False),
+                ),
+            ):
+                prepare_cp_forward(forward_batch)
+
+            metadata = forward_batch.attn_cp_metadata
+            self.assertEqual(
+                forward_batch.num_token_non_padded.item(),
+                metadata.per_rank_logical_token[rank],
+            )
+            self.assertLess(
+                metadata.per_rank_logical_token[rank],
+                metadata.per_rank_actual_token[rank],
+            )
+
+    def test_cp_no_a2a_does_not_apply_a_contiguous_prefix_mask(self):
+        num_tokens = 19
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(num_tokens),
+            forward_mode=_ExtendMode(),
+            seq_lens_cpu=[9, 10],
+            extend_seq_lens_cpu=[9, 10],
+            attn_cp_metadata=None,
+            num_token_non_padded=torch.tensor([num_tokens], dtype=torch.int32),
+            global_num_tokens_cpu=None,
+            out_cache_loc=None,
+        )
+        with (
+            get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
+            patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                return_value=8,
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_none=lambda: True),
+            ),
+        ):
+            prepare_cp_forward(forward_batch)
+
+        self.assertEqual(forward_batch.num_token_non_padded.item(), num_tokens)
 
     def test_zigzag_gathers_hidden_states_to_original_order(self):
         cp_size = 4

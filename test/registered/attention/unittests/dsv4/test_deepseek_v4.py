@@ -387,9 +387,49 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertFalse(
             AttentionBackend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
+        self.assertFalse(AttentionBackend.rebuilds_cp_bcg_metadata_at_replay)
         self.assertTrue(
             DeepseekV4AttnBackend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
+        self.assertTrue(DeepseekV4AttnBackend.rebuilds_cp_bcg_metadata_at_replay)
+
+    def test_cp_reindex_changes_query_rows_but_keeps_global_write_locations(self):
+        metadata = self._make_core_metadata(0)
+        num_global_rows = 4
+        token_indices = torch.tensor([2, 0], dtype=torch.int64)
+
+        original_query_fields = {}
+        for field_name in metadata._CP_REINDEX_FIELDS:
+            old = getattr(metadata, field_name)
+            shape = (num_global_rows, *old.shape[1:])
+            value = torch.arange(torch.tensor(shape).prod().item()).reshape(shape)
+            setattr(metadata, field_name, value)
+            original_query_fields[field_name] = value.clone()
+
+        for field_name in metadata._CP_GLOBAL_FIELDS:
+            if field_name == "swa_out_cache_loc":
+                continue
+            value = torch.arange(3, dtype=torch.int32) + 100
+            setattr(metadata, field_name, value)
+
+        metadata.apply_cp_reindex(num_tokens=3, token_indices=token_indices)
+
+        for field_name, original in original_query_fields.items():
+            self.assertTrue(
+                torch.equal(
+                    getattr(metadata, field_name),
+                    original.index_select(0, token_indices),
+                ),
+                field_name,
+            )
+        for field_name in ("raw_out_loc", "c4_out_loc", "c128_out_loc"):
+            self.assertTrue(
+                torch.equal(
+                    getattr(metadata, field_name),
+                    torch.arange(3, dtype=torch.int32) + 100,
+                ),
+                field_name,
+            )
 
     def test_prefill_snapshot_declares_pre_replay_boundary(self):
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds

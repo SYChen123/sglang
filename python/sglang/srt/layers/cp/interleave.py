@@ -125,6 +125,23 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     def shard_local_tokens(self, input_: Any) -> Any:
         return self._interleave_shard(input_)
 
+    def local_token_indices(self, forward_batch, padded_num_tokens: int) -> Any:
+        return torch.arange(
+            self.cp_rank,
+            padded_num_tokens,
+            self.cp_size,
+            device=forward_batch.positions.device,
+            dtype=torch.int64,
+        )
+
+    def layout_all_ranks(self, x: Any, forward_batch) -> Any:
+        metadata = forward_batch.attn_cp_metadata
+        physical_tokens = sum(metadata.per_rank_actual_token)
+        logical_tokens = metadata.total_seq_lens
+        padded = x.new_zeros((physical_tokens, *x.shape[1:]))
+        padded[:logical_tokens] = x[:logical_tokens]
+        return padded.view(-1, self.cp_size, *x.shape[1:]).transpose(0, 1).flatten(0, 1)
+
     def shard_per_request(
         self,
         extend_seqs_cpu: List[int],
