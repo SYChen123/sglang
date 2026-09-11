@@ -627,25 +627,6 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
-def deepseek_v4_cp_attention(
-    attention: MQALayer,
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    x_quant,
-) -> torch.Tensor:
-    context = get_tc_piecewise_forward_context()
-    assert context is not None
-    return attention._forward_impl(
-        x=x,
-        positions=positions,
-        forward_batch=context.forward_batch,
-        x_quant=x_quant,
-    )
-
-
-bcg_deepseek_v4_cp_attention = eager_on_graph(True)(deepseek_v4_cp_attention)
-
-
 class MqaAttentionBase(nn.Module):
     def __init__(
         self,
@@ -1618,8 +1599,6 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         x_quant=None,
     ) -> torch.Tensor:
-        if is_cp_active(forward_batch) and is_in_breakable_cuda_graph():
-            return bcg_deepseek_v4_cp_attention(self, x, positions, x_quant)
         return self._forward_impl(x, positions, forward_batch, x_quant)
 
     def _forward_impl(
@@ -1750,11 +1729,7 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if (
-                forward_batch.forward_mode.is_extend()
-                and is_in_breakable_cuda_graph()
-                and not is_cp_active(forward_batch)
-            ):
+            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )

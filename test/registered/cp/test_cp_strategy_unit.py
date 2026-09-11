@@ -236,7 +236,6 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512},
-            capture_seq_lens_by_bucket={2048: (1024, 1024)},
         )
 
         short_context = self._make_forward_batch()
@@ -248,9 +247,6 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
         self.assertEqual(short_key, long_key)
         self.assertEqual(short_key.size, 2048)
-        self.assertEqual(
-            runner.prefill_cp_bcg_input.capture_seq_lens(2048), (1024, 1024)
-        )
         self.assertEqual(runner.prefill_cp_bcg_input.bucket_local_tokens[2048], 512)
 
     def test_capture_spec_rejects_context_layout_incompatible_with_zigzag(self):
@@ -350,6 +346,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             positions=torch.empty((8,), dtype=torch.int64),
             moe_input_ids=torch.empty((32,), dtype=torch.int64),
             draft_hidden_states=torch.empty((8, 3)),
+            global_reorder_indices=torch.empty((16,), dtype=torch.int64),
             bucket_local_tokens={16: 8},
         )
         global_draft_hidden_states = torch.arange(48).view(16, 3).float()
@@ -401,7 +398,40 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             torch.equal(
                 forward_batch.input_ids_global,
                 torch.tensor(
-                    [0, 1, 14, 15, 2, 3, 12, 13, 4, 5, 10, 11, 6, 7, 8, 9]
+                    [
+                        0,
+                        1,
+                        14,
+                        15,
+                        0,
+                        0,
+                        0,
+                        0,
+                        2,
+                        3,
+                        12,
+                        13,
+                        0,
+                        0,
+                        0,
+                        0,
+                        4,
+                        5,
+                        10,
+                        11,
+                        0,
+                        0,
+                        0,
+                        0,
+                        6,
+                        7,
+                        8,
+                        9,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]
                 ),
             )
         )
@@ -831,6 +861,31 @@ class TestCPZigzagStrategy(CustomTestCase):
 
         self.assertEqual(forward_batch.num_token_non_padded.item(), num_tokens)
 
+    def test_cp_bcg_preserves_global_bucket_cache_locations(self):
+        num_tokens = 19
+        global_bucket = 32
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(num_tokens),
+            forward_mode=_ExtendMode(),
+            seq_lens_cpu=[9, 10],
+            extend_seq_lens_cpu=[9, 10],
+            attn_cp_metadata=None,
+            num_token_non_padded=None,
+            global_num_tokens_cpu=None,
+            out_cache_loc=torch.arange(global_bucket),
+            cp_bcg_global_num_tokens=global_bucket,
+        )
+        with (
+            get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
+            patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                return_value=8,
+            ),
+        ):
+            prepare_cp_forward(forward_batch)
+
+        self.assertEqual(forward_batch.out_cache_loc.shape[0], global_bucket)
+
     def test_zigzag_gathers_hidden_states_to_original_order(self):
         cp_size = 4
         seq_lens = [11, 13]
@@ -896,6 +951,51 @@ class TestCPZigzagStrategy(CustomTestCase):
                 )
 
             self.assertTrue(torch.equal(gathered, kv))
+
+    def test_zigzag_bcg_fixed_gather_reorders_live_tokens_and_zero_tail(self):
+        cp_size = 4
+        seq_lens = [9, 10]
+        num_tokens = sum(seq_lens)
+        global_bucket = 32
+        kv = torch.arange(num_tokens * 2).view(num_tokens, 2)
+        strategy = ZigzagCPStrategy(cp_size=cp_size)
+        metas = []
+        rank_tensors = []
+
+        for rank in range(cp_size):
+            with (
+                get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size),
+                patch(
+                    "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                    return_value=8,
+                ),
+            ):
+                metadata = strategy.build_metadata(
+                    num_tokens=num_tokens,
+                    seqs_len=seq_lens,
+                    extend_seqs_len=seq_lens,
+                )
+                pad_logical_token_to_physical(metadata)
+                fb = self._forward_batch(metadata, seq_lens)
+                rank_tensors.append(strategy.shard_hidden_states(kv, fb))
+                metas.append(metadata)
+
+        forward_batch = self._forward_batch(metas[0], seq_lens)
+        reorder_indices = torch.empty(global_bucket, dtype=torch.int64)
+        strategy.prepare_bcg_global_reorder_indices_(reorder_indices, forward_batch)
+
+        with get_parallel().override(
+            attn_cp_group=_FakeCPGroup(rank_tensors),
+            attn_cp_rank=0,
+            attn_cp_size=cp_size,
+        ):
+            gathered = strategy.gather_kv_cache(
+                rank_tensors[0], forward_batch, stream=None
+            )
+
+        self.assertTrue(torch.equal(gathered[:num_tokens], kv))
+        self.assertEqual(gathered.shape, (global_bucket, 2))
+        self.assertEqual(torch.count_nonzero(gathered[num_tokens:]), 0)
 
     def test_zigzag_padding_aligns_local_tensors(self):
         cp_size = 2

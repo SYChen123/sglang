@@ -528,7 +528,7 @@ class DeepseekV4AttnBackend(
 ):
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_prefill_cuda_graph_max_context_size: bool = True
-    rebuilds_cp_bcg_metadata_at_replay: bool = True
+    rebuilds_cp_bcg_metadata_at_replay: bool = False
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
 
@@ -766,10 +766,14 @@ class DeepseekV4AttnBackend(
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
         cp_active = forward_batch is not None and is_cp_active(forward_batch)
+        cp_global_num_tokens = num_tokens
         if cp_active:
             cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
+            cp_global_num_tokens = (
+                getattr(forward_batch, "cp_bcg_global_num_tokens", None) or num_tokens
+            )
 
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -790,13 +794,15 @@ class DeepseekV4AttnBackend(
             need_compress=need_compress,
             is_prefill=True,
             dspark_block_size=dspark_block_size,
-            num_tokens=num_tokens if cp_active else None,
+            num_tokens=cp_global_num_tokens if cp_active else None,
         )
         if cp_active:
             strategy = get_cp_strategy()
             assert strategy is not None
             strategy.reindex_attn_metadata(
-                core_attn_metadata, forward_batch, num_tokens=num_tokens
+                core_attn_metadata,
+                forward_batch,
+                num_tokens=cp_global_num_tokens,
             )
             core_attn_metadata.init_flashmla_related(is_prefill=True)
         indexer_metadata = (
@@ -1589,13 +1595,6 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
-        if is_cp_active(metadata_batch):
-            # DSV4 CP uses one eager attention island per layer under BCG. Its
-            # global compressor plans and cache-write locations vary with the
-            # live batch, so expose the freshly built metadata directly rather
-            # than forcing it into capture-time tensor shapes.
-            self.forward_metadata = static_metadata
-            return
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata

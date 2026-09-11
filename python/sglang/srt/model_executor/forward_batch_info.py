@@ -571,6 +571,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # shape from the live batch. None preserves eager/default graph behavior.
     max_seq_len_override: Optional[int] = None
 
+    # Global token capacity of the selected CP prefill BCG bucket. The model
+    # body runs on a fixed CP-local row count, while KV/cache/compressor paths
+    # materialize a fixed global tensor of this size. None outside CP BCG.
+    cp_bcg_global_num_tokens: Optional[int] = None
+
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None

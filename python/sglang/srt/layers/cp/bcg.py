@@ -116,8 +116,8 @@ class PrefillCPBCGInput:
     positions: torch.Tensor
     moe_input_ids: Optional[torch.Tensor] = None
     draft_hidden_states: Optional[torch.Tensor] = None
+    global_reorder_indices: Optional[torch.Tensor] = None
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
-    capture_seq_lens_by_bucket: Dict[int, Tuple[int, ...]] = field(default_factory=dict)
     live_local_tokens: int = 0
 
     @staticmethod
@@ -129,10 +129,10 @@ class PrefillCPBCGInput:
         cp_size: int,
         align_size: int,
     ) -> Tuple[Tuple[int, ...], int]:
-        """Return a stable request layout and its largest local CP shard.
+        """Return the dummy capture layout and its largest local CP shard.
 
-        Keeping the synthetic request layout fixed for a token bucket makes its
-        local graph extent stable while respecting the captured context limit.
+        The layout is derived on demand from the token and context limits. It is
+        capture input, not an independently keyed graph dimension.
         """
         if max_context_size <= 0:
             raise ValueError(
@@ -147,9 +147,9 @@ class PrefillCPBCGInput:
                 f"request pool has only {max_bs}."
             )
 
-        base, remainder = divmod(num_tokens, num_requests)
         seq_lens = tuple(
-            base + int(request_id < remainder) for request_id in range(num_requests)
+            min(max_context_size, num_tokens - start)
+            for start in range(0, num_tokens, max_context_size)
         )
         min_zigzag_tokens = cp_size * 2
         if min(seq_lens) < min_zigzag_tokens:
@@ -185,17 +185,15 @@ class PrefillCPBCGInput:
         max_context_size = (
             runner.max_context_size or runner.model_runner.model_config.context_len
         )
-        capture_seq_lens_by_bucket: Dict[int, Tuple[int, ...]] = {}
         bucket_local_tokens: Dict[int, int] = {}
         for num_tokens in runner.capture_num_tokens:
-            seq_lens, local_tokens = cls._build_capture_spec(
+            _, local_tokens = cls._build_capture_spec(
                 num_tokens=num_tokens,
                 max_context_size=max_context_size,
                 max_bs=runner.max_bs,
                 cp_size=strategy.cp_size,
                 align_size=get_cp_padding_align_size(),
             )
-            capture_seq_lens_by_bucket[num_tokens] = seq_lens
             bucket_local_tokens[num_tokens] = local_tokens
         max_local_tokens = max(bucket_local_tokens.values())
         moe_input_rows = max_local_tokens * (
@@ -230,17 +228,11 @@ class PrefillCPBCGInput:
                     if runner.static_draft_hidden_states is not None
                     else None
                 ),
+                global_reorder_indices=torch.empty(
+                    (runner.max_num_tokens,), dtype=torch.int64
+                ),
                 bucket_local_tokens=bucket_local_tokens,
-                capture_seq_lens_by_bucket=capture_seq_lens_by_bucket,
             )
-
-    def capture_seq_lens(self, num_tokens: int) -> Tuple[int, ...]:
-        try:
-            return self.capture_seq_lens_by_bucket[num_tokens]
-        except KeyError as exc:
-            raise RuntimeError(
-                f"Missing CP BCG capture layout for token bucket {num_tokens}."
-            ) from exc
 
     @property
     def max_local_tokens(self) -> int:
@@ -316,6 +308,7 @@ class PrefillCPBCGInput:
         capture: bool,
     ) -> None:
         """Shard global prefill inputs into fixed-address CP-local buffers."""
+        forward_batch.cp_bcg_global_num_tokens = static_num_tokens
         # Replay batches may reuse a ForwardBatch object whose metadata was
         # built for a different request layout. Always rebuild before sharding.
         forward_batch.attn_cp_metadata = None
@@ -345,6 +338,18 @@ class PrefillCPBCGInput:
                 cp_size = len(metadata.per_rank_actual_token)
                 metadata.per_rank_actual_token = [captured_local_tokens] * cp_size
                 metadata.max_rank_len = [captured_local_tokens] * cp_size
+
+        strategy = get_cp_strategy()
+        assert isinstance(strategy, ZigzagCPStrategy)
+        assert self.global_reorder_indices is not None
+        if static_num_tokens > self.global_reorder_indices.shape[0]:
+            raise RuntimeError(
+                f"CP BCG global bucket {static_num_tokens} exceeds the reorder "
+                f"buffer capacity {self.global_reorder_indices.shape[0]}."
+            )
+        strategy.prepare_bcg_global_reorder_indices_(
+            self.global_reorder_indices[:static_num_tokens], forward_batch
+        )
 
         raw_tokens = int(forward_batch.extend_num_tokens)
         global_input_ids = forward_batch.input_ids[:raw_tokens]
@@ -397,8 +402,6 @@ class PrefillCPBCGInput:
         forward_batch.input_embeds = input_embeds
         forward_batch.positions = positions
 
-        strategy = get_cp_strategy()
-        assert strategy is not None
         if self.draft_hidden_states is not None:
             spec_info = getattr(forward_batch, "spec_info", None)
             global_draft_hidden_states = getattr(spec_info, "hidden_states", None)

@@ -191,7 +191,10 @@ def prepare_cp_forward(forward_batch) -> None:
         )
 
     if getattr(forward_batch, "out_cache_loc", None) is not None:
-        forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
+        cache_num_tokens = (
+            getattr(forward_batch, "cp_bcg_global_num_tokens", None) or num_tokens
+        )
+        forward_batch.out_cache_loc = forward_batch.out_cache_loc[:cache_num_tokens]
 
 
 def cp_split_before_forward(

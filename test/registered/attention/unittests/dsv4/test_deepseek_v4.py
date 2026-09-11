@@ -391,7 +391,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertTrue(
             DeepseekV4AttnBackend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
-        self.assertTrue(DeepseekV4AttnBackend.rebuilds_cp_bcg_metadata_at_replay)
+        self.assertFalse(DeepseekV4AttnBackend.rebuilds_cp_bcg_metadata_at_replay)
 
     def test_cp_reindex_changes_query_rows_but_keeps_global_write_locations(self):
         metadata = self._make_core_metadata(0)

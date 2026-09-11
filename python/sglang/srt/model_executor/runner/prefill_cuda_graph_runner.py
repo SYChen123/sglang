@@ -1351,21 +1351,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         context_length = min(
             self.max_context_size or model_context_length, model_context_length
         )
-        if self.enable_cp_bcg_capture:
-            # The CP input owns a canonical request layout for each token bucket,
-            # bounded by the configured fixed maximum context size.
-            capture_seq_lens = list(
-                self.prefill_cp_bcg_input.capture_seq_lens(num_tokens)
-            )
-            assert max(capture_seq_lens) <= context_length
-        else:
-            # A prefill bucket is an aggregate token count. Capture it as the
-            # fewest synthetic requests, with every request containing no more
-            # than context_length tokens.
-            capture_seq_lens = [
-                min(context_length, num_tokens - start)
-                for start in range(0, num_tokens, context_length)
-            ]
+        # A prefill bucket is an aggregate token count. Capture it as the
+        # fewest synthetic requests, with every request containing no more
+        # than context_length tokens. CP uses the same dummy layout only to
+        # prepare capture-time metadata; it is not an additional graph axis.
+        capture_seq_lens = [
+            min(context_length, num_tokens - start)
+            for start in range(0, num_tokens, context_length)
+        ]
         if self.prefill_backend_name == Backend.FULL:
             # Full captures a fixed request-axis shape; unused slots are
             # zero-length sentinels after the context-bounded real requests.

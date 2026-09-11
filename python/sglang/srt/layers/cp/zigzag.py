@@ -69,6 +69,11 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     max_rank_len: Optional[List[int]] = None
     per_rank_logical_token: Optional[List[int]] = None
 
+    # CP BCG captures a fixed-size rank-major all-gather followed by a device
+    # permutation. Its address is stable across replay; only the indices are
+    # refreshed from the live request layout before launching the graph.
+    bcg_global_reorder_indices: Optional[Any] = None
+
     # Per-sequence FlashAttention tensors (shape [bs] or [bs + 1]).
     kv_len_prev_tensor: Optional[Any] = None
     kv_len_next_tensor: Optional[Any] = None
@@ -407,6 +412,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
+        reorder_indices = getattr(
+            forward_batch.attn_cp_metadata, "bcg_global_reorder_indices", None
+        )
+        if reorder_indices is not None:
+            gathered = self._all_gather_fixed_physical_rows(x, forward_batch)
+            return gathered.index_select(0, reorder_indices)
+
         gathered = self._all_gather_reorganized(x, forward_batch)
         chunks = torch.split(
             gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
@@ -414,6 +426,74 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return torch.cat(
             [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
         )
+
+    def prepare_bcg_global_reorder_indices_(
+        self, output: torch.Tensor, forward_batch
+    ) -> None:
+        """Refresh a fixed-address rank-major-to-global BCG permutation."""
+        metadata = forward_batch.attn_cp_metadata
+        assert output.ndim == 1 and output.dtype == torch.int64
+        assert metadata.per_rank_logical_token is not None
+        assert len(set(metadata.per_rank_actual_token)) == 1
+
+        global_tokens = metadata.total_seq_lens
+        physical_rank_tokens = metadata.per_rank_actual_token[0]
+        assert output.numel() >= global_tokens
+
+        # Every logical row is overwritten below. A replay bucket can be larger
+        # than the live batch; map that tail to one physical padding row, whose
+        # input is zero-filled by PrefillCPBCGInput.prepare().
+        output.zero_()
+        padding_source = None
+        for rank in range(self.cp_size):
+            logical_indices = self._logical_token_indices(
+                metadata, rank, device=output.device
+            )
+            logical_rank_tokens = metadata.per_rank_logical_token[rank]
+            assert logical_indices.numel() == logical_rank_tokens
+            local_offsets = torch.arange(
+                logical_rank_tokens, device=output.device, dtype=torch.int64
+            )
+            output[logical_indices] = rank * physical_rank_tokens + local_offsets
+            if padding_source is None and logical_rank_tokens < physical_rank_tokens:
+                padding_source = rank * physical_rank_tokens + logical_rank_tokens
+
+        if output.numel() > global_tokens:
+            assert padding_source is not None, (
+                "A padded CP BCG global bucket requires at least one physical "
+                "padding row."
+            )
+            output[global_tokens:].fill_(padding_source)
+
+        assert output.numel() == 0 or int(output.max()) < (
+            physical_rank_tokens * self.cp_size
+        )
+        metadata.bcg_global_reorder_indices = output
+
+    def _all_gather_fixed_physical_rows(self, x: torch.Tensor, forward_batch):
+        metadata = forward_batch.attn_cp_metadata
+        assert len(set(metadata.per_rank_actual_token)) == 1
+        physical_rank_tokens = metadata.per_rank_actual_token[0]
+        assert x.shape[0] == physical_rank_tokens, (
+            f"CP BCG gather expected {physical_rank_tokens} local rows, "
+            f"got {x.shape[0]}."
+        )
+
+        group = get_parallel().attn_cp_group
+        ctx = (
+            use_symmetric_memory(group, disabled=not is_allocation_symmetric())
+            if x.is_cuda
+            else nullcontext()
+        )
+        with ctx:
+            gathered = torch.empty(
+                physical_rank_tokens * self.cp_size,
+                *x.shape[1:],
+                device=x.device,
+                dtype=x.dtype,
+            )
+        group.all_gather_into_tensor(gathered, x)
+        return gathered
 
     def get_supported_attention_backend(self):
         return [
