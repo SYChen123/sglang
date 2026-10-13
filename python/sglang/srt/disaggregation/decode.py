@@ -1730,7 +1730,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             metadata_kwargs.get("destination") != KVTransferDestination.HOST
             and self.transfer_queue.enable_staging
             and hasattr(decode_req.kv_receiver, "require_staging")
-            and decode_req.kv_receiver.require_staging
+            and not _is_fake_transfer(decode_req.req)
+            and (decode_req.kv_receiver.require_staging or not self.is_mla_backend)
         ):
             # Register before send_metadata, which triggers the STAGING_REQ
             # prefetch (dropped for an unregistered room); tiny race, correct order.

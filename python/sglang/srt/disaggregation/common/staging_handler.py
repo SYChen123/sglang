@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 # chunk, so the re-enqueue retry does not busy-spin a core.
 STAGING_WATERMARK_WAIT_S = 0.001
 
+# Bound on-demand allocation readiness waits and total deferral time.
+STAGING_READY_SPIN_S = 0.5
+STAGING_MAX_WAIT_S = 60
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
 
@@ -56,6 +60,7 @@ class PrefillStagingContext:
     )
     # (room, chunk_idx, session_id) keys for chunks already requested.
     prefetch_requested: set = dataclasses.field(default_factory=set)
+    request_lock: object = dataclasses.field(default_factory=threading.Lock)
     # Rooms that have already had their full prefetch fan-out triggered. Used
     # to short-circuit per-room prefetch entry on every chunk after the first.
     prefetched_rooms: set = dataclasses.field(default_factory=set)

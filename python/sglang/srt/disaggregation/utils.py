@@ -235,26 +235,26 @@ def poll_and_all_reduce_with_staging(
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
-        if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
-            decode_req
-        ):
+        if staging_handler.is_staging_room(
+            decode_req.req.bootstrap_room
+        ) and not staging_handler.is_done(decode_req):
             staging_handler.advance_scatter(decode_req)
 
     # allow test injection of failure probability at runtime
     receivers = [dr.kv_receiver for dr in decode_reqs]
     raw_polls = _poll_with_failure_injection(receivers)
     for i, decode_req in enumerate(decode_reqs):
-        if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
-            decode_req
-        ):
+        if staging_handler.is_staging_room(
+            decode_req.req.bootstrap_room
+        ) and staging_handler.is_failed(decode_req):
             # Staging completion timed out; KVPoll.Failed == 0 propagates
             # through the MIN all_reduce.
             raw_polls[i] = int(KVPoll.Failed)
             continue
         if raw_polls[i] == int(KVPoll.Success):
-            if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
-                decode_req
-            ):
+            if staging_handler.is_staging_room(
+                decode_req.req.bootstrap_room
+            ) and not staging_handler.is_done(decode_req):
                 raw_polls[i] = int(KVPoll.Transferring)
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None:
