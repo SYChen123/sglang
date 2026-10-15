@@ -658,7 +658,8 @@ class _HostTable:
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
         # Advisory before the first touch: pages are allocated huge at fault time.
-        self.mm.madvise(mmap.MADV_HUGEPAGE)
+        # Some Python builds use headers predating the Linux MADV_HUGEPAGE (14).
+        self.mm.madvise(getattr(mmap, "MADV_HUGEPAGE", 14))
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,
