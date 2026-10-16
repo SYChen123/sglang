@@ -3092,7 +3092,9 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode() or self._use_c2_verify_epilogue(
+            layer, x, forward_batch
+        ):
             self._low_ratio_compress_decode(layer, x, req, pos)
         elif (
             forward_batch.forward_mode.is_target_verify()
@@ -3145,6 +3147,29 @@ class DeepseekV4AttnBackend(
                     and layer.compressor.use_fused_compress
                 ),
             )
+
+    def _use_c2_verify_epilogue(self, layer, x, forward_batch) -> bool:
+        """Static, consecutive verify rows can share the Hopper C2 decode chain."""
+        if not (
+            envs.SGLANG_OPT_DSV41_C2_EPILOGUE.get()
+            and get_platform().is_sm90
+            and forward_batch.forward_mode.is_target_verify()
+            and not self.is_dspark_draft
+            and layer.compress_ratio == 2
+            and not layer.compressor.use_fused_compress
+            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+        ):
+            return False
+        width = self.speculative_num_draft_tokens
+        if (
+            width is None
+            or width <= 1
+            or x.shape[0] != forward_batch.batch_size * width
+        ):
+            return False
+        state = self.token_to_kv_pool.get_attention_compress_states(layer.layer_id)
+        # The first row may need carried state; do not wrap over its predecessor.
+        return width < state.ring_size
 
     def _low_ratio_in_prefill_graph(self) -> bool:
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -3201,6 +3226,9 @@ class DeepseekV4AttnBackend(
             slots,
             group_pos,
             fuse_index_store=is_sm100_or_newer(),
+            fuse_main_store=(
+                envs.SGLANG_OPT_DSV41_C2_EPILOGUE.get() and get_platform().is_sm90
+            ),
         )
 
     def _low_ratio_compress_fused(
@@ -3385,10 +3413,47 @@ class DeepseekV4AttnBackend(
         group_pos,
         *,
         fuse_index_store=False,
+        fuse_main_store=False,
     ) -> None:
         pool = self.token_to_kv_pool
-        latent = layer.compressor.finish(pooled)
-        freqs = layer.freqs_cis[group_pos]
+        main_stored = False
+        if (
+            fuse_main_store
+            and layer.compress_ratio == 2
+            and layer.rope_head_dim == 64
+            and not pool.uniform_fp8
+            and pool.get_extra_key_layout(layer.layer_id) is KVLayout.V4
+        ):
+            from sglang.kernels.ops.attention.dsv4.c2_epilogue_sm90 import (
+                c2_epilogue_sm90,
+                can_use_c2_epilogue,
+            )
+
+            cache = pool.get_extra_key_buffer(layer.layer_id)
+            page_size = pool.get_extra_key_page_size(layer.layer_id)
+            if can_use_c2_epilogue(
+                pooled,
+                layer.compressor.norm.weight,
+                layer.freqs_cis,
+                slots,
+                group_pos,
+                cache,
+                page_size,
+            ):
+                latent, freqs = c2_epilogue_sm90(
+                    pooled,
+                    layer.compressor.norm.weight,
+                    layer.compressor.norm.eps,
+                    layer.freqs_cis,
+                    slots,
+                    group_pos,
+                    cache,
+                    page_size,
+                )
+                main_stored = True
+        if not main_stored:
+            latent = layer.compressor.finish(pooled)
+            freqs = layer.freqs_cis[group_pos]
         # Index keys come from the pre-RoPE latent, so publish them first. Stored
         # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
         if layer.indexer is not None and layer.indexer.owns_k:
@@ -3418,6 +3483,8 @@ class DeepseekV4AttnBackend(
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
                 )
+        if main_stored:
+            return
         if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
             # The fp4 cache stores e2m1 codes: the kernel rotates the tail and
             # rounds once, with no fake quantization in between.

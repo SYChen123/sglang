@@ -1,5 +1,9 @@
-"""Fused ratio-2 decode pair-pooling, bitwise identical to the torch pool_pairs
-path; a rounding difference here can change the indexer's top-k selection."""
+"""Fused ratio-2 decode/verify pair-pooling with bitwise parity to torch pool_pairs.
+
+Softmax follows torch's operation order with correctly rounded exp and division.
+The weighted products must round separately before summation; FMA contraction
+would change the latent and can change the indexer's top-k selection.
+"""
 
 from typing import Tuple
 
@@ -36,8 +40,9 @@ def _c2_decode_pool_kernel(
     out_loc = tl.load(out_loc_ptr + row)
     req = tl.load(req_ptr + row)
 
-    # Raw location 0 is the padded-graph-row sentinel, and its req_pool_idx 0 may
-    # be a live request, so such a row's pair state goes to the spare row.
+    # `pos % 2 == 1`, and the padded-graph-row reroute: a row whose raw location
+    # is the reserved slot 0 carries req_pool_idx 0 -- possibly a live request --
+    # so its pair state goes to the spare row instead.
     odd = (pos % 2) == 1
     if RING_SIZE:
         r = tl.where(
@@ -53,13 +58,44 @@ def _c2_decode_pool_kernel(
 
     kv = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
     score = tl.load(score_ptr + row * D + offs, mask=mask, other=0.0)
-    p_kv = tl.load(state_kv_ptr + r * STATE_KV_STRIDE + offs, mask=mask, other=0.0)
-    p_score = tl.load(
-        state_score_ptr + r * STATE_SCORE_STRIDE + offs, mask=mask, other=0.0
+    in_batch = tl.full((), False, tl.int1)
+    if RING_SIZE:
+        # Verify rows for each request are consecutive. Read a same-batch
+        # predecessor from immutable projections, not another program's ring
+        # write. Mask the carried-state load too, avoiding an unused racing read.
+        prev_req = tl.load(req_ptr + row - 1, mask=row > 0, other=-1)
+        prev_pos = tl.load(pos_ptr + row - 1, mask=row > 0, other=-2)
+        prev_raw_loc = tl.load(raw_out_loc_ptr + row - 1, mask=row > 0, other=0)
+        in_batch = (
+            (row > 0)
+            & (req == prev_req)
+            & (pos == prev_pos + 1)
+            & (raw_loc != 0)
+            & (prev_raw_loc != 0)
+        )
+    p_kv = tl.load(
+        state_kv_ptr + r * STATE_KV_STRIDE + offs,
+        mask=mask & ~in_batch,
+        other=0.0,
     )
+    p_score = tl.load(
+        state_score_ptr + r * STATE_SCORE_STRIDE + offs,
+        mask=mask & ~in_batch,
+        other=0.0,
+    )
+    if RING_SIZE:
+        batch_p_kv = tl.load(
+            kv_ptr + (row - 1) * D + offs, mask=mask & in_batch, other=0.0
+        )
+        batch_p_score = tl.load(
+            score_ptr + (row - 1) * D + offs, mask=mask & in_batch, other=0.0
+        )
+        p_kv = tl.where(in_batch, batch_p_kv, p_kv)
+        p_score = tl.where(in_batch, batch_p_score, p_score)
 
     if RING_SIZE:
-        # Each live request has one decode row. Pad rows never modify the ring.
+        # Decode has one row per request; verify writes consecutive, distinct
+        # ring positions. Pad rows never modify the ring.
         write_row = req * RING_SIZE + pos % RING_SIZE
         tl.store(
             state_kv_ptr + write_row * STATE_KV_STRIDE + offs,
@@ -83,15 +119,16 @@ def _c2_decode_pool_kernel(
             mask=mask,
         )
 
-    # libdevice.exp, not tl.exp: the approximate exponential changes the latent.
+    # Match torch's pair-axis softmax operation order. libdevice.exp is required;
+    # tl.exp uses an approximate exponential and can change the pooled latent.
     m = tl.maximum(p_score, score)
     e0 = libdevice.exp(p_score - m)
     e1 = libdevice.exp(score - m)
     denom = e0 + e1
-    # The + 0.0 below prevents FMA contraction: torch rounds both products first.
-    # tl.div_rn matches torch division; Triton's / is an approximate reciprocal on CUDA.
-    t0 = p_kv * tl.div_rn(e0, denom)
-    t1 = kv * tl.div_rn(e1, denom)
+    # The + 0.0 prevents FMA contraction: torch rounds both products before summing.
+    # Use libdevice.div_rn to match torch division; Triton's / uses an approximate reciprocal.
+    t0 = p_kv * libdevice.div_rn(e0, denom)
+    t1 = kv * libdevice.div_rn(e1, denom)
     t0 = t0 + 0.0
     t1 = t1 + 0.0
     pooled = t0 + t1
@@ -115,11 +152,14 @@ def c2_decode_pool(
     *,
     ring_size: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Ratio-2 decode pair pooling; updates `state_kv` / `state_score` in place.
+    """One launch for the ratio-2 decode/target-verify epilogue.
 
-    With ring_size > 0 the state halves may be views of an interleaved
-    CompressStatePool ring, one row per request otherwise; pad_row is the
-    padded-graph-row sentinel and is never written.
+    Returns `(pooled, group_pos, slots)` and updates `state_kv` / `state_score`
+    in place. With ring_size > 0, the state halves may be views of an interleaved
+    CompressStatePool ring; pad_row is its sentinel row and stays untouched.
+    Each request's live rows must be consecutive in row order and position,
+    with fewer than ring_size rows, so the carried predecessor stays readable.
+    The default retains the legacy single-row-per-request state contract.
     """
     assert kv.is_contiguous() and score.is_contiguous()
     assert state_kv.stride(1) == state_score.stride(1) == 1
@@ -128,6 +168,8 @@ def c2_decode_pool(
     pooled = torch.empty_like(kv)
     group_pos = torch.empty_like(pos)
     slots = torch.empty(n, dtype=out_loc.dtype, device=out_loc.device)
+    if n == 0:
+        return pooled, group_pos, slots
     _c2_decode_pool_kernel[(n,)](
         kv,
         score,

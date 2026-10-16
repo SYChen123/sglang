@@ -423,3 +423,14 @@ for _fn in (
         )
     )
 del _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.c2_epilogue_sm90",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsv4.c2_epilogue_sm90:c2_epilogue_sm90",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 9))}
+        ),
+    )
+)
