@@ -14,16 +14,64 @@
 
 """Padding helpers shared by context-parallel strategies."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
 from sglang.srt.runtime_context import get_parallel
 
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
-def get_cp_padding_align_size() -> int:
+
+def should_unpad_cp_decode_attn_tp(
+    model_runner: Optional["ModelRunner"] = None,
+) -> bool:
+    """Decode/verify/draft rows are replicated under CP decode attention TP.
+
+    Only interleave CP with a validated attention-TP architecture can skip CP
+    alignment. Real context-parallel prefills still pad collective inputs.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.cp.cp_decode_attn_tp import (
+        CP_DECODE_ATTN_TP_SUPPORTED_ARCHS,
+    )
+
+    model_supported = True
+    if model_runner is not None:
+        hf_config = getattr(model_runner.model_config, "hf_config", None)
+        architectures = getattr(hf_config, "architectures", None) or ()
+        model_supported = any(
+            arch in CP_DECODE_ATTN_TP_SUPPORTED_ARCHS for arch in architectures
+        )
+    parallel = get_parallel()
+    return bool(
+        getattr(parallel, "enable_cp_decode_attn_tp", False)
+        and parallel.enable_prefill_cp
+        and parallel.cp_strategy == "interleave"
+        and parallel.dp_size == 1
+        and parallel.attn_dp_size == 1
+        and parallel.attn_cp_size > 1
+        and parallel.attn_tp_size == 1
+        and model_supported
+        and not envs.SGLANG_CP_DISABLE_DECODE_UNPADDING.get()
+    )
+
+
+def get_cp_padding_align_size(
+    forward_mode: Optional["ForwardMode"] = None,
+    model_runner: Optional["ModelRunner"] = None,
+) -> int:
     """Return the token-count alignment required by the active CP strategy."""
     from sglang.srt.layers.cp.base import is_zigzag
+
+    if (
+        forward_mode is not None
+        and not forward_mode.is_context_parallel_extend()
+        and should_unpad_cp_decode_attn_tp(model_runner)
+    ):
+        return 1
 
     attn_cp_size = get_parallel().attn_cp_size
     if is_zigzag():

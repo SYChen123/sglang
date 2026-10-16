@@ -4224,6 +4224,8 @@ def require_mlp_sync():
 def get_cuda_graph_batch_size_alignment(
     *, gathered_buffer_required: Optional[bool] = None
 ) -> int:
+    from sglang.srt.layers.cp.padding import should_unpad_cp_decode_attn_tp
+
     if gathered_buffer_required is None:
         gathered_buffer_required = require_gathered_buffer()
     alignment = 1
@@ -4232,7 +4234,11 @@ def get_cuda_graph_batch_size_alignment(
     if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size
     # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
-    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
+    if (
+        not is_hip()
+        and not should_unpad_cp_decode_attn_tp()
+        and alignment % get_parallel().attn_cp_size != 0
+    ):
         alignment *= get_parallel().attn_cp_size
     return alignment
 
