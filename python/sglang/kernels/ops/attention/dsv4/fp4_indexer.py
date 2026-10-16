@@ -834,12 +834,16 @@ def _fp4_index_logits_paged_kernel(
     table_ptr,
     mask_ptr,
     out_ptr,
+    blocks_ptr,
+    block_scores_ptr,
     L,
     page_size,
     row_stride,
     req_stride,
     mask_stride,
     out_stride,
+    blocks_stride,
+    block_scores_stride,
     stride_qb,
     stride_qh,
     stride_wb,
@@ -847,6 +851,9 @@ def _fp4_index_logits_paged_kernel(
     HALF_D: tl.constexpr,
     RATIO: tl.constexpr,
     HAS_MASK: tl.constexpr,
+    USE_CANDIDATES: tl.constexpr,
+    CANDIDATE_BLOCK_SIZE: tl.constexpr,
+    WRITE_BLOCK_SCORES: tl.constexpr,
     BLOCK_L: tl.constexpr,
 ):
     b = tl.program_id(0)
@@ -859,9 +866,19 @@ def _fp4_index_logits_paged_kernel(
             valid = valid & tl.load(
                 mask_ptr + b * mask_stride + offs_l, mask=offs_l < n_vis, other=False
             )
+        logical = offs_l
+        if USE_CANDIDATES:
+            block = tl.load(
+                blocks_ptr + b * blocks_stride + offs_l // CANDIDATE_BLOCK_SIZE,
+                mask=valid,
+                other=0,
+            )
+            logical = block * CANDIDATE_BLOCK_SIZE + offs_l % CANDIDATE_BLOCK_SIZE
         slot = (
             tl.load(
-                req_table_ptr + req * req_stride + offs_l * RATIO, mask=valid, other=0
+                req_table_ptr + req * req_stride + logical * RATIO,
+                mask=valid,
+                other=0,
             ).to(tl.int64)
             // RATIO
         )
@@ -881,6 +898,23 @@ def _fp4_index_logits_paged_kernel(
             HALF_D,
         )
         tl.store(out_ptr + b * out_stride + offs_l, logit, mask=offs_l < L)
+        if WRITE_BLOCK_SCORES:
+            blocks_per_tile: tl.constexpr = BLOCK_L // CANDIDATE_BLOCK_SIZE
+            scores = tl.max(
+                tl.reshape(logit, (blocks_per_tile, CANDIDATE_BLOCK_SIZE)), 1
+            )
+            blocks = tile * blocks_per_tile + tl.arange(0, blocks_per_tile)
+            # Always retain the newest visible block, including a partial pair.
+            scores = tl.where(
+                (n_vis > 0) & (blocks == (n_vis - 1) // CANDIDATE_BLOCK_SIZE),
+                float("inf"),
+                scores,
+            )
+            tl.store(
+                block_scores_ptr + b * block_scores_stride + blocks,
+                scores,
+                blocks < tl.cdiv(L, CANDIDATE_BLOCK_SIZE),
+            )
 
 
 def fp4_index_logits_paged(
@@ -894,7 +928,11 @@ def fp4_index_logits_paged(
     max_len: int,
     ratio: int,
     candidate_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
+    *,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 8,
+    return_block_scores: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Score visible compressed positions directly from the request table.
 
     The output has graph-stable capacity, but only the first ``lens[b]`` values
@@ -907,6 +945,14 @@ def fp4_index_logits_paged(
     assert req_table.stride(1) == 1
     if candidate_mask is not None:
         assert candidate_mask.shape[1] >= max_len and candidate_mask.stride(1) == 1
+    if candidate_blocks is not None or return_block_scores:
+        assert candidate_block_size in (1, 2, 4, 8, 16, 32, 64)
+    if candidate_blocks is not None:
+        assert candidate_mask is None and not return_block_scores
+        assert candidate_blocks.shape[0] == q.shape[0]
+        assert candidate_blocks.dtype == torch.int32
+        assert candidate_blocks.stride(1) == 1
+        max_len = candidate_blocks.shape[1] * candidate_block_size
     batch, heads, _ = q.shape
     q = q.contiguous()
     weights = weights.to(torch.bfloat16).contiguous()
@@ -919,8 +965,19 @@ def fp4_index_logits_paged(
         device=q.device,
         alignment_bytes=get_input_stride_alignment_bytes(),
     )
+    block_scores = (
+        aligned_new_empty(
+            shape=(batch, triton.cdiv(max_len, candidate_block_size)),
+            dtype=torch.float32,
+            device=q.device,
+            alignment_bytes=16,
+        )
+        if return_block_scores
+        else None
+    )
+    result = (out, block_scores) if return_block_scores else out
     if not batch or not max_len:
-        return out
+        return result
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     workers = min(triton.cdiv(max_len, 64), triton.cdiv(num_sms * 4, batch))
     _fp4_index_logits_paged_kernel[(batch, workers)](
@@ -932,12 +989,16 @@ def fp4_index_logits_paged(
         table,
         candidate_mask,
         out,
+        candidate_blocks,
+        block_scores,
         max_len,
         page_size,
         table.stride(0),
         req_table.stride(0),
         candidate_mask.stride(0) if candidate_mask is not None else 0,
         out.stride(0),
+        candidate_blocks.stride(0) if candidate_blocks is not None else 0,
+        block_scores.stride(0) if block_scores is not None else 0,
         q.stride(0),
         q.stride(1),
         weights.stride(0),
@@ -945,7 +1006,10 @@ def fp4_index_logits_paged(
         HALF_D=INDEX_HEAD_DIM // 2,
         RATIO=ratio,
         HAS_MASK=candidate_mask is not None,
+        USE_CANDIDATES=candidate_blocks is not None,
+        CANDIDATE_BLOCK_SIZE=candidate_block_size,
+        WRITE_BLOCK_SCORES=return_block_scores,
         BLOCK_L=64,
         num_warps=4,
     )
-    return out
+    return result

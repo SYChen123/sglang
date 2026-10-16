@@ -15,7 +15,13 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     topk_among_blocks,
 )
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
+from sglang.srt.runtime_context import get_platform
 
+from .compact_decode import (
+    CompactDecodeBlocks,
+    can_publish_compact,
+    compact_decode,
+)
 from .scoring import (
     DeepGEMMPrefillData,
     PagedDecodeScores,
@@ -90,6 +96,19 @@ class DenseBlocksBackend:
             self._torch_consume_prefill(inputs, published)
 
     def publish_decode(self, inputs: DecodeInputs):
+        if get_platform().is_sm90 and can_publish_compact(
+            inputs,
+            self.req_to_token,
+            topk_blocks=self.topk_blocks,
+            block_size=self.block_size,
+        ):
+            return compact_decode(
+                inputs,
+                pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                topk_blocks=self.topk_blocks,
+                block_size=self.block_size,
+            )
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -121,8 +140,18 @@ class DenseBlocksBackend:
     def consume_decode(
         self,
         inputs: DecodeInputs,
-        published: Optional[BlockIds],
+        published: Optional[BlockIds | CompactDecodeBlocks],
     ) -> None:
+        if isinstance(published, CompactDecodeBlocks):
+            compact_decode(
+                inputs,
+                pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                topk_blocks=self.topk_blocks,
+                block_size=self.block_size,
+                published=published,
+            )
+            return
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
