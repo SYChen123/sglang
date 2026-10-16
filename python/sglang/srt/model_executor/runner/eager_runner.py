@@ -363,14 +363,23 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
+        model_input_ids = forward_batch.input_ids
         if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
             input_embeds, positions, model_kwargs = prepare_inputs(
                 forward_batch, **kwargs
             )
         else:
             input_embeds = kwargs.get("input_embeds")
+            if prepare_language_inputs := getattr(
+                model, "prepare_language_model_inputs", None
+            ):
+                # Vision encoding needs the complete image sequence. Preserve
+                # scheduler hash IDs while sharding the remapped language IDs.
+                model_input_ids, input_embeds = prepare_language_inputs(
+                    model_input_ids, forward_batch, input_embeds
+                )
             if input_embeds is None:
-                input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+                input_embeds = model.get_input_embeddings()(model_input_ids)
             positions = forward_batch.positions
             model_kwargs = {}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
@@ -380,7 +389,7 @@ class EagerRunner(BaseRunner):
             input_embeds,
             positions,
             forward_batch,
-            forward_batch.input_ids,
+            model_input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
             hidden_states = model.model(
@@ -400,6 +409,9 @@ class EagerRunner(BaseRunner):
                 if capture_aux_hidden_states
                 else hidden_states
             )
+
+        if cp_logits := getattr(model, "logits_from_cp_hidden_states", None):
+            return cp_logits(hidden_states, aux_hidden_states, forward_batch)
 
         stream = torch.cuda.current_stream()
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)

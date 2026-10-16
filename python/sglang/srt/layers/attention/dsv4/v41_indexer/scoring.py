@@ -304,7 +304,15 @@ def prefill_requests(
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    assert req is not None, "the torch indexer needs the batch's rows"
+    if req is None:
+        # CP already provides this rank's row count for each request, including
+        # empty shards. Reconstruct ownership without using full-prefill lengths.
+        assert inputs.rows_per_request_device is not None
+        req = torch.repeat_interleave(
+            inputs.req_pool_indices,
+            inputs.rows_per_request_device.to(torch.int64),
+            output_size=pos.shape[0],
+        )
     inputs.reset_outputs()
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
