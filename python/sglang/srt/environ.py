@@ -1635,8 +1635,12 @@ class Envs:
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     # Hopper prefill A/B: DeepGEMM uses FP32 post-dot arithmetic, while Triton
-    # preserves the reference BF16 intermediate rounding. Keep DG opt-in.
+    # preserves the reference BF16 intermediate rounding. Auto mixes both by
+    # query tile size; keep DG and auto opt-in.
     SGLANG_DSV41_SM90_PREFILL_INDEXER = EnvStr("triton")
+    # In auto mode, select DG by the actual rank-local query rows in a score
+    # chunk, after applying the score-buffer budget (not request/context size).
+    SGLANG_DSV41_SM90_PREFILL_INDEXER_DEEPGEMM_MIN_ROWS = EnvInt(128)
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
