@@ -30,6 +30,7 @@ from .scoring import (
     prefill_requests,
     score_tiles,
     select_decode,
+    select_prefill_chunk,
     topk_ragged,
     write_decode,
     write_prefill,
@@ -232,7 +233,7 @@ class DenseBlocksBackend:
                         ),
                     )
                 )
-                idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
+                idx = select_prefill_chunk(chunk, request.k)
                 write_prefill(inputs, request, chunk, idx)
         width = max((ids.shape[1] for _, ids in picked), default=0)
         blocks = torch.full(
@@ -257,6 +258,17 @@ class DenseBlocksBackend:
             req_to_token=self.req_to_token,
         ):
             for chunk in chunks:
+                if chunk.use_ragged_topk:
+                    keep = candidate_block_mask(
+                        published.blocks[chunk.tok], request.lc, self.block_size
+                    )
+                    chunk.scores.masked_fill_(~keep, -torch.inf)
+                    idx = select_prefill_chunk(chunk, request.k)
+                    valid = idx >= 0
+                    picked_scores = chunk.scores.gather(1, idx.long().clamp_min(0))
+                    idx = idx.masked_fill(~valid | ~(picked_scores > -torch.inf), -1)
+                    write_prefill(inputs, request, chunk, idx)
+                    continue
                 idx = topk_among_blocks(
                     chunk.scores,
                     chunk.lens,

@@ -283,6 +283,7 @@ class ChunkScores(msgspec.Struct, frozen=True):
     tok: torch.Tensor
     lens: torch.Tensor
     scores: torch.Tensor  # [rows, lc] bf16, -inf past each row's length
+    use_ragged_topk: bool = False
 
 
 class DecodeScores(msgspec.Struct, frozen=True):
@@ -300,6 +301,12 @@ def prefill_requests(
     req_to_token: torch.Tensor,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
     """Requests with nothing visible yet are skipped."""
+    from .sm90_prefill import prefill_requests as sm90_requests
+    from .sm90_prefill import use_sm90_prefill
+
+    if use_sm90_prefill(inputs):
+        yield from sm90_requests(inputs, token_to_kv_pool, req_to_token)
+        return
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
@@ -366,13 +373,28 @@ def write_prefill(
     idx: torch.Tensor,
 ) -> None:
     k, lc = request.k, request.lc
-    idx = idx.sort(dim=-1).values
+    idx = idx.masked_fill(idx < 0, lc).sort(dim=-1).values
     reach = idx < chunk.lens[:, None]
     if inputs.out_page_indices is not None:
         inputs.out_page_indices[chunk.tok, :k] = torch.where(
             reach, request.slots[idx.clamp_max(lc - 1)], -1
         ).to(torch.int32)
     inputs.out_raw_indices[chunk.tok, :k] = torch.where(reach, idx, -1).to(torch.int32)
+
+
+def select_prefill_chunk(chunk: ChunkScores, k: int) -> torch.Tensor:
+    if not chunk.use_ragged_topk:
+        return chunk.scores.topk(k, dim=-1, sorted=False).indices
+    selected = torch.empty(
+        (chunk.scores.shape[0], k), dtype=torch.int32, device=chunk.scores.device
+    )
+    topk_ragged(
+        chunk.scores,
+        chunk.lens,
+        out=selected,
+        offsets=torch.zeros_like(chunk.lens),
+    )
+    return selected
 
 
 class PagedDecodeScores(msgspec.Struct, frozen=True):

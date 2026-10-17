@@ -26,6 +26,7 @@ from .scoring import (
     prefill_requests,
     quantize_index_q,
     select_decode,
+    select_prefill_chunk,
     write_prefill,
 )
 from .types import (
@@ -89,7 +90,7 @@ class FullTopKIndexer:
         )
         for request, chunks in requests:
             for chunk in chunks:
-                idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
+                idx = select_prefill_chunk(chunk, request.k)
                 write_prefill(inputs, request, chunk, idx)
 
     def _deep_gemm_decode(self, inputs: DecodeInputs) -> None:

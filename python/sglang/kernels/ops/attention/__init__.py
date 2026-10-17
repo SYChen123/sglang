@@ -410,6 +410,23 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
 del _fn
 
 for _fn in (
+    "unpack_fp4_index_keys_to_fp8",
+    "quantize_bf16_index_queries_fp8",
+    "fp8_index_logits_prefill",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.sm90_fp8_prefill:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 9))}
+            ),
+        )
+    )
+del _fn
+
+for _fn in (
     "candidate_block_state",
     "candidate_position_counts",
     "finalize_candidate_topk",
