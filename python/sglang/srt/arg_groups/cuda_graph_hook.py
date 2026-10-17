@@ -106,6 +106,12 @@ def apply_prefill_cp_cuda_graph_default(server_args: Any):
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
     cfg = resolving_view(server_args)
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    if is_deepseek_v4(model_config_of(server_args).hf_config):
+        # Preserve DSV4's eager default. CP support does not establish a
+        # performance win; --cuda-graph-backend-prefill=breakable opts in.
+        return
     # Preserve explicit graph choices, but enable supported CP paths even if
     # an earlier default disabled capture before CP/backend resolution.
     if (Phase.PREFILL, "backend") not in getattr(
@@ -190,15 +196,11 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
                 not in model_config_of(server_args).hf_config.architectures
             ),
         ),
-        # DSV4 is BCG-compatible but introduces heavy memory pressure: the
-        # c4 indexer scratch is pinned in the capture pool and OOMs. The
-        # supported CP path captures a smaller rank-local body.
+        # DSV4 remains opt-in even with CP: capture can pin large scratch
+        # buffers. An explicit prefill backend bypasses this default policy.
         (
             "DeepSeek-V4 (heavy capture-pool memory pressure)",
-            lambda: (
-                is_deepseek_v4(model_config_of(server_args).hf_config)
-                and not supports_prefill_cp_bcg(server_args)
-            ),
+            lambda: is_deepseek_v4(model_config_of(server_args).hf_config),
         ),
         # CP all_gather replay size mismatch under BCG. Defer the warning until
         # apply_prefill_cp_cuda_graph_default has resolved the final CP default.

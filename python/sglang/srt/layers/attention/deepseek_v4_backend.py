@@ -110,6 +110,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
@@ -650,8 +651,13 @@ class DSV4AttnMetadata:
         assert self.present_ratios == other.present_ratios
         assert self.low_ratios == other.low_ratios
 
+        if self.request_window_layout is not None:
+            assert other.request_window_layout is not None
+            self.request_window_layout.copy_(other.request_window_layout)
+
         tensor_copy_fields = [
             "raw_out_loc",
+            "swa_out_cache_loc",
             "seq_lens_casual",
             "positions_casual",
             "c4_out_loc",
@@ -956,7 +962,9 @@ _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
 def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
-    return get_exec().graph.cuda_graph_config.prefill.max_seq_len
+    config = get_exec().graph.cuda_graph_config.prefill
+    limits = [n for n in (config.max_seq_len, config.max_context_size) if n is not None]
+    return min(limits) if limits else None
 
 
 @dataclass
@@ -990,11 +998,7 @@ class DSV4Metadata:
 
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
-    # Captured with the late layers on a tail block (decoder SWA bounded replay
-    # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
-    prefill_graph_tail: bool = False
-    # Captured with the late layers on a tail block (decoder SWA bounded replay
-    # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
+    # Replay rebuilds the fixed-capacity late-layer metadata when set.
     prefill_graph_tail: bool = False
 
     @property
@@ -1446,7 +1450,12 @@ class DeepseekV4AttnBackend(
             dspark_swa_buffers=dspark_swa_buffers,
             num_tokens=num_write_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
-            num_groups=len(extend_seq_lens_cpu),
+            num_groups=(
+                self._prefill_graph_tail_capacity() // SWA_WINDOW
+                if use_prefill_cuda_graph
+                else len(extend_seq_lens_cpu)
+            ),
+            window_num_tokens=num_tokens,
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(
@@ -1583,7 +1592,7 @@ class DeepseekV4AttnBackend(
         """Rows the late layers run over inside the prefill CUDA graph: every
         request's SWA_WINDOW tail at the request cap, so one capture fits any batch."""
         if self._bcg_tail_capacity is None:
-            max_reqs = self.model_runner.server_args.max_running_requests
+            max_reqs = get_schedule().max_running_requests
             if not max_reqs:
                 max_reqs = int(self.model_runner.req_to_token_pool.size)
             self._bcg_tail_capacity = int(max_reqs) * SWA_WINDOW
@@ -1592,10 +1601,17 @@ class DeepseekV4AttnBackend(
     def _prefill_graph_tail_block_rows(self, forward_batch: ForwardBatch) -> int:
         """Tail block rows for the captured shape this batch is padded to: the
         shape's token count, capped at the request-cap capacity."""
-        return min(
-            self._prefill_graph_tail_capacity(),
-            int(forward_batch.out_cache_loc.shape[0]),
-        )
+        capacity = self._prefill_graph_tail_capacity()
+        if is_cp_active(forward_batch):
+            cp_size = get_parallel().attn_cp_size
+            # Each request contributes at most ceil(SWA_WINDOW / CP) rows to
+            # any rank, even when request boundaries have different residues.
+            per_rank_cap = (capacity // SWA_WINDOW) * (
+                (SWA_WINDOW + cp_size - 1) // cp_size
+            )
+            local_rows = max(forward_batch.attn_cp_metadata.per_rank_actual_token)
+            return min(per_rank_cap, local_rows) * cp_size
+        return min(capacity, int(forward_batch.out_cache_loc.shape[0]))
 
     def _prefill_graph_tail_buffers(
         self, device: torch.device, pos_dtype: torch.dtype, loc_dtype: torch.dtype
@@ -1646,15 +1662,19 @@ class DeepseekV4AttnBackend(
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
         )
+        if for_prefill_graph and is_cp_active(forward_batch):
+            return self._build_cp_prefill_graph_tail_metadata(
+                forward_batch,
+                token_indices,
+                tail_lens_cpu,
+                swa_replay_start,
+                max_seq_len_override=max_seq_len_override,
+            )
         graph_tail = None
         if for_prefill_graph:
             # Captured segments gather/scatter through persistent buffers of a
             # fixed capacity: real rows first, padding rows gather row 0 and
             # scatter to a dummy row past the extend.
-            assert not is_cp_active(forward_batch), (
-                "decoder SWA bounded replay inside the prefill CUDA graph does not "
-                "support prefill CP"
-            )
             real_rows = int(sum(tail_lens_cpu))
             # The block is sized per captured shape: a shape of N tokens can
             # never hold more than N tail rows, so small shapes get small
@@ -1799,11 +1819,90 @@ class DeepseekV4AttnBackend(
             )
         return metadata
 
+    def _build_cp_prefill_graph_tail_metadata(
+        self,
+        forward_batch,
+        token_indices,
+        tail_lens_cpu,
+        swa_replay_start,
+        *,
+        max_seq_len_override,
+    ) -> DSV4Metadata:
+        from sglang.srt.layers.attention.dsv4.cp_bcg import CPTailGraphBuffers
+
+        cp_size = get_parallel().attn_cp_size
+        rows = self._prefill_graph_tail_block_rows(forward_batch)
+        local_rows = rows // cp_size
+        tail_lens = torch.tensor(
+            tail_lens_cpu, dtype=torch.int32, device=token_indices.device
+        )
+        layout = self._late_layer_tail_cp_layout(
+            forward_batch, token_indices, tail_lens, local_capacity=local_rows
+        )
+        buffers_by_rows = getattr(self, "_bcg_cp_tail_buffers", None)
+        if buffers_by_rows is None:
+            self._bcg_cp_tail_buffers = buffers_by_rows = {}
+        buffers = buffers_by_rows.get(rows)
+        if buffers is None:
+            buffers_by_rows[rows] = buffers = CPTailGraphBuffers.create(
+                forward_batch, local_rows=local_rows, cp_size=cp_size
+            )
+        cp_metadata = buffers.update(
+            forward_batch,
+            token_indices,
+            tail_lens,
+            layout,
+            cp_rank=get_parallel().attn_cp_rank,
+        )
+        metadata = self.init_forward_metadata_prefill(
+            max_seq_len=max_seq_len_override or int(forward_batch.seq_lens_cpu.max()),
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            seq_lens_cpu=forward_batch.seq_lens_cpu.tolist(),
+            out_cache_loc=buffers.out_cache_loc,
+            num_tokens=sum(tail_lens_cpu),
+            extend_seq_lens=tail_lens,
+            extend_seq_lens_cpu=tail_lens_cpu,
+            extend_start_loc=torch.cumsum(tail_lens, dim=0) - tail_lens,
+            swa_replay_start=swa_replay_start,
+            use_prefill_cuda_graph=True,
+            forward_batch=forward_batch,
+            cp_metadata=cp_metadata,
+        )
+        core = metadata.core_attn_metadata
+        swa_loc = (
+            core.request_window_layout.write_loc
+            if self.token_to_kv_pool.request_window is not None
+            else self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                buffers.out_cache_loc
+            ).to(torch.int32)
+        )
+        buffers.swa_out_cache_loc.copy_(swa_loc)
+        core.swa_out_cache_loc = buffers.swa_out_cache_loc
+        metadata.low_ratio_req_indices = buffers.req_global
+        metadata.low_ratio_pos_i64 = buffers.pos_global
+        metadata.late_layer_tail = LateLayerTail(
+            token_indices=buffers.token_indices,
+            positions=buffers.positions,
+            extend_seq_lens=tail_lens,
+            extend_seq_lens_cpu=tail_lens_cpu,
+            swa_out_cache_loc=buffers.swa_out_cache_loc,
+            cp_metadata=cp_metadata,
+            local_lens_cpu=layout["local_lens_cpu"],
+            req_global=buffers.req_global,
+            pos_global=buffers.pos_global,
+            scatter_indices=buffers.scatter_indices,
+            real_rows_count=sum(layout["local_lens_cpu"]),
+        )
+        return metadata
+
     def _late_layer_tail_cp_layout(
         self,
         forward_batch: ForwardBatch,
         token_indices: torch.Tensor,
         tail_lens: torch.Tensor,
+        *,
+        local_capacity: Optional[int] = None,
     ) -> dict:
         cp_rank = get_parallel().attn_cp_rank
         cp_size = get_parallel().attn_cp_size
@@ -1811,7 +1910,8 @@ class DeepseekV4AttnBackend(
         total = token_indices.shape[0]
         owner_rank = token_indices % cp_size
         counts = torch.bincount(owner_rank, minlength=cp_size).tolist()
-        max_local = max(counts)
+        max_local = max(counts) if local_capacity is None else local_capacity
+        assert max(counts) <= max_local, (counts, max_local)
         order = torch.argsort(owner_rank, stable=True)
         rank_starts = torch.tensor(
             [sum(counts[:r]) for r in range(cp_size)],
@@ -1881,18 +1981,27 @@ class DeepseekV4AttnBackend(
             forward_batch.num_token_non_padded,
         )
         if tail.real_rows_count is not None:
-            forward_batch.global_num_token_non_padded_cpu = tail.real_rows_count
+            global_rows = (
+                sum(tail.extend_seq_lens_cpu)
+                if tail.cp_metadata is not None
+                else tail.real_rows_count
+            )
+            forward_batch.global_num_token_non_padded_cpu = global_rows
             non_padded = forward_batch.global_num_token_non_padded
             if non_padded is not None:
                 if self._bcg_tail_num_token_non_padded is None:
                     self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
                 bound = torch.clamp(
                     non_padded,
-                    max=tail.real_rows_count,
+                    max=global_rows,
                     out=self._bcg_tail_num_token_non_padded,
                 )
                 forward_batch.global_num_token_non_padded = bound
                 forward_batch.num_token_non_padded = bound
+            if tail.cp_metadata is not None:
+                forward_batch.num_token_non_padded = (
+                    tail.cp_metadata.moe_local_token_count
+                )
         # The layers before the switch published top-k into the full metadata's
         # buffers; carry the tail rows into the tail metadata's (padding stays -1).
         full_core = saved[0].core_attn_metadata
@@ -2813,7 +2922,11 @@ class DeepseekV4AttnBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
-        max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        max_seq_len = (
+            forward_batch.max_seq_len_override
+            or (_prefill_graph_max_seq_len() if is_cp_active(forward_batch) else None)
+            or self.MAX_SEQ_LEN_FOR_CAPTURE
+        )
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
@@ -2875,8 +2988,12 @@ class DeepseekV4AttnBackend(
         metadata_batch = (
             static_forward_batch if static_forward_batch is not None else forward_batch
         )
+        self.encoder_replay = metadata_batch.encoder_swa_replay
+        self.encoder_row_floor = metadata_batch.encoder_swa_row_floor
         max_seq_len = (
-            metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+            metadata_batch.max_seq_len_override
+            or (_prefill_graph_max_seq_len() if is_cp_active(metadata_batch) else None)
+            or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
         static_metadata = self._build_forward_metadata(
             metadata_batch,
@@ -3060,11 +3177,17 @@ class DeepseekV4AttnBackend(
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
         cp_meta = forward_batch.attn_cp_metadata
-        total = int(cp_meta.total_seq_lens)
         tail = self.forward_metadata.late_layer_tail
+        # Graph collectives keep bucket-sized tensors; the eager compressor and
+        # scorer process only live rows and never hash CP padding as a request.
+        total = sum(
+            tail.extend_seq_lens_cpu
+            if tail is not None
+            else forward_batch.extend_seq_lens_cpu
+        )
         if tail is not None:
             q_lens_cpu = tail.local_lens_cpu
-            req_global, pos_global = tail.req_global, tail.pos_global
+            req_global, pos_global = tail.req_global[:total], tail.pos_global[:total]
         else:
             q_lens_cpu = interleave_rows_per_request(
                 _as_int_list(forward_batch.extend_seq_lens_cpu),
@@ -4273,6 +4396,7 @@ class DeepseekV4AttnBackend(
         num_tokens: Optional[int] = None,
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
+        window_num_tokens: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4AttnMetadata:
         small_metadata = (
@@ -4332,6 +4456,7 @@ class DeepseekV4AttnBackend(
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=swa_replay_start,
                 num_groups=num_groups,
+                num_tokens=window_num_tokens,
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths

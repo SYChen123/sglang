@@ -23,18 +23,18 @@ import torch
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
-from sglang.srt.layers.cp.base import (
-    ContextParallelStrategyKind,
-    CPAttentionBackendKind,
-    get_cp_strategy,
-)
+from sglang.srt.configs.model_config import is_deepseek_v4
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_interleave_input_ids,
+    cp_shard_hidden_states,
     cp_split_before_forward,
     prepare_cp_forward,
 )
@@ -49,34 +49,25 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
-PREFILL_CP_BCG_SUPPORTED_COMBINATIONS: set[
-    tuple[ContextParallelStrategyKind, CPAttentionBackendKind]
-] = {
-    (ContextParallelStrategyKind.ZIGZAG, CPAttentionBackendKind.TRTLLM_MHA),
-}
-
-
 def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     """Return whether the selected prefill-CP configuration supports BCG."""
 
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
-    if not (
+    prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
+    supports_layout = (
+        cfg.cp_strategy == "zigzag" and prefill_attention_backend == "trtllm_mha"
+    ) or (
+        cfg.cp_strategy == "interleave"
+        and prefill_attention_backend == "dsv4"
+        and is_deepseek_v4(model_config_of(server_args).hf_config)
+    )
+    return (
         cfg.enable_prefill_cp
         and cfg.pp_size == 1
         and resolved.attn_cp_size == cfg.tp_size
-    ):
-        return False
-    prefill_attention_backend, _ = attention_backends_of(resolved)
-    try:
-        combination = (
-            ContextParallelStrategyKind.from_string(cfg.cp_strategy),
-            CPAttentionBackendKind.from_string(prefill_attention_backend),
-        )
-    except ValueError:
-        # Other backends (or an unresolved backend/strategy) cannot use CP BCG.
-        return False
-    return combination in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS
+        and supports_layout
+    )
 
 
 def enable_cp_bcg_capture(server_args: ServerArgs) -> bool:
@@ -118,6 +109,9 @@ class PrefillCPBCGInput:
 
     input_embeds: torch.Tensor
     positions: torch.Tensor
+    input_ids: Optional[torch.Tensor] = None
+    num_token_non_padded: Optional[torch.Tensor] = None
+    rank_major_input_ids: Optional[torch.Tensor] = None
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
 
@@ -134,6 +128,12 @@ class PrefillCPBCGInput:
                 ),
                 positions=torch.zeros(
                     (runner.max_num_tokens,),
+                    dtype=torch.int64,
+                ),
+                input_ids=torch.zeros((runner.max_num_tokens,), dtype=torch.int64),
+                num_token_non_padded=torch.zeros((), dtype=torch.int32),
+                rank_major_input_ids=torch.zeros(
+                    (runner.max_num_tokens * get_cp_strategy().cp_size,),
                     dtype=torch.int64,
                 ),
             )
@@ -248,9 +248,16 @@ class PrefillCPBCGInput:
         raw_tokens = int(forward_batch.extend_num_tokens)
         global_input_ids = forward_batch.input_ids[:raw_tokens]
         global_positions = forward_batch.positions[:raw_tokens]
-        global_input_embeds = runner.model_runner.model.get_input_embeddings()(
-            global_input_ids
-        )
+        model = runner.model_runner.model
+        language_input_ids = global_input_ids
+        global_input_embeds = None
+        if prepare_language := getattr(model, "prepare_language_model_inputs", None):
+            language_input_ids, global_input_embeds = prepare_language(
+                global_input_ids, forward_batch, None
+            )
+        local_input_ids = cp_shard_hidden_states(language_input_ids, forward_batch)
+        if global_input_embeds is None:
+            global_input_embeds = model.get_input_embeddings()(language_input_ids)
         local_input_embeds, local_positions = cp_split_before_forward(
             global_input_embeds,
             global_positions,
@@ -278,12 +285,45 @@ class PrefillCPBCGInput:
 
         input_embeds = self.input_embeds[:captured_local_tokens]
         positions = self.positions[:captured_local_tokens]
+        assert self.input_ids is not None
+        input_ids = self.input_ids[:captured_local_tokens]
         input_embeds.zero_()
         positions.zero_()
+        input_ids.zero_()
         input_embeds[:live_local_tokens].copy_(local_input_embeds)
         positions[:live_local_tokens].copy_(local_positions)
+        input_ids[:live_local_tokens].copy_(local_input_ids)
         forward_batch.input_embeds = input_embeds
-        forward_batch.positions = positions
+        if not hasattr(model, "logits_from_cp_hidden_states"):
+            # Existing zigzag backends consume local batch positions directly.
+            forward_batch.positions = positions
+            self.live_local_tokens = live_local_tokens
+            return
+        forward_batch._cp_positions = positions
+        # Keep the global input_ids field intact: the runner uses its length to
+        # select the global capture bucket. The DSV4 body consumes this fixed,
+        # rank-local view for hash routing and MegaMoE.
+        forward_batch._cp_input_ids = input_ids
+        global_ids = cp_interleave_input_ids(language_input_ids, forward_batch)
+        assert self.rank_major_input_ids is not None
+        global_id_buffer = self.rank_major_input_ids[: global_ids.numel()]
+        global_id_buffer.copy_(global_ids)
+        forward_batch.input_ids_global = global_id_buffer
+        assert self.num_token_non_padded is not None
+        metadata = forward_batch.attn_cp_metadata
+        logical_tokens = (
+            metadata.per_rank_logical_token or metadata.per_rank_actual_token
+        )
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        self.num_token_non_padded.fill_(logical_tokens[strategy.cp_rank])
+        if forward_batch.num_token_non_padded is not None:
+            forward_batch.num_token_non_padded = self.num_token_non_padded
+        if isinstance(get_cp_strategy(), InterleaveCPStrategy):
+            # MoE reads a GPU scalar, not capture-time Python row counts.
+            forward_batch.attn_cp_metadata.moe_local_token_count = (
+                self.num_token_non_padded
+            )
         self.live_local_tokens = live_local_tokens
 
         if isinstance(get_cp_strategy(), InterleaveCPStrategy):
@@ -325,7 +365,9 @@ def execute_prefill_cp_bcg(
             static_forward_batch,
             **kwargs,
         )
-        local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
+        cp_logits = getattr(model, "logits_from_cp_hidden_states", None)
+        if cp_logits is None:
+            local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
 
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
@@ -340,6 +382,9 @@ def execute_prefill_cp_bcg(
                 if capture_aux_hidden_states
                 else hidden_states
             )
+
+        if cp_logits is not None:
+            return cp_logits(hidden_states, aux_hidden_states, static_forward_batch)
 
         hidden_states = cp_gather_after_forward(
             hidden_states,

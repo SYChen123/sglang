@@ -61,7 +61,13 @@ def window_layout(
     capacity: int = 256,
     floor: Optional[torch.Tensor] = None,
     num_groups: Optional[int] = None,
+    num_tokens: Optional[int] = None,
 ):
+    padded_rows = pos.numel()
+    if num_tokens is not None:
+        assert 0 < num_tokens <= padded_rows, (num_tokens, padded_rows)
+        req, pos = req[:num_tokens], pos[:num_tokens]
+        floor = floor[:num_tokens] if floor is not None else None
     n = pos.numel()
     if n == 0:
         raise ValueError("request-window layout needs at least one query")
@@ -107,6 +113,18 @@ def window_layout(
     history_loc = torch.arange(history_rows, device=device)
 
     commit_mask = (group_last - offset) < capacity
+    pad = padded_rows - n
+    if pad:
+        # Padding must not change the last live request's group boundary,
+        # first position or history. Give it workspace rows and no KV owner.
+        req = torch.nn.functional.pad(req, (0, pad))
+        pos = torch.nn.functional.pad(pos, (0, pad))
+        write_loc = torch.arange(
+            history_rows, history_rows + padded_rows, device=device, dtype=torch.int32
+        )
+        indices = torch.nn.functional.pad(indices, (0, 0, 0, pad), value=-1)
+        lengths = torch.nn.functional.pad(lengths, (0, pad))
+        commit_mask = torch.nn.functional.pad(commit_mask, (0, pad), value=False)
     return WindowLayout(
         req,
         pos,
@@ -118,7 +136,7 @@ def window_layout(
         history_loc,
         history_valid,
         commit_mask,
-        history_rows + n,
+        history_rows + padded_rows,
     )
 
 

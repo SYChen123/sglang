@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
 )
+from sglang.srt.layers.attention.dsv4.cp_bcg import CPTailGraphBuffers
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4Model
@@ -335,6 +336,294 @@ class TestDSV41CPTail(CustomTestCase):
         ):
             DeepseekV4ForCausalLM.logits_from_cp_hidden_states(model, None, None, batch)
         self.assertIs(batch.attn_cp_metadata, full_cp)
+
+
+class TestDSV41CPTailGraph(CustomTestCase):
+    def _batch(self, cp_size):
+        return SimpleNamespace(
+            input_ids=torch.arange(64, dtype=torch.int64) + 1000,
+            positions=torch.arange(64, dtype=torch.int64),
+            out_cache_loc=torch.arange(64, dtype=torch.int64) + 256,
+            req_pool_indices=torch.tensor([2, 3, 4]),
+            batch_size=3,
+            forward_mode=ForwardMode.EXTEND,
+            attn_cp_metadata=SimpleNamespace(
+                per_rank_actual_token=[64 // cp_size] * cp_size
+            ),
+        )
+
+    def _layout(self, batch, indices, lengths, cp_size, rank):
+        parallel = SimpleNamespace(attn_cp_rank=rank, attn_cp_size=cp_size)
+        with patch(f"{BACKEND}.get_parallel", return_value=parallel):
+            return DeepseekV4AttnBackend._late_layer_tail_cp_layout(
+                None, batch, indices, lengths, local_capacity=8
+            )
+
+    def test_changed_layout_reuses_addresses_and_masks_every_padding_row(self):
+        cases = [
+            (torch.tensor([0, 1, 16, 17, 18, 19]), torch.tensor([2, 3, 1])),
+            (torch.tensor([8, 9, 10, 11]), torch.tensor([1, 2, 1])),
+        ]
+        for cp_size in (2, 4, 8):
+            for rank in range(cp_size):
+                batch = self._batch(cp_size)
+                buffers = CPTailGraphBuffers.create(
+                    batch, local_rows=8, cp_size=cp_size
+                )
+                pointers = {
+                    name: value.data_ptr() for name, value in vars(buffers).items()
+                }
+                for indices, lengths in cases:
+                    with self.subTest(
+                        cp_size=cp_size, rank=rank, indices=indices.tolist()
+                    ):
+                        layout = self._layout(batch, indices, lengths, cp_size, rank)
+                        meta = buffers.update(
+                            batch, indices, lengths, layout, cp_rank=rank
+                        )
+                        self.assertEqual(
+                            pointers,
+                            {
+                                name: value.data_ptr()
+                                for name, value in vars(buffers).items()
+                            },
+                        )
+                        self.assertEqual(meta.per_rank_actual_token, [8] * cp_size)
+                        self.assertEqual(meta.per_rank_logical_token, [8] * cp_size)
+                        self.assertEqual(meta.total_seq_lens, 8 * cp_size)
+                        torch.testing.assert_close(
+                            meta.gather_index.sort().values, torch.arange(8 * cp_size)
+                        )
+                        packed = torch.full((cp_size, 8), -999, dtype=torch.int64)
+                        for r in range(cp_size):
+                            owned = indices[indices % cp_size == r]
+                            packed[r, : owned.numel()] = owned
+                        torch.testing.assert_close(
+                            packed.flatten()[meta.gather_index][: indices.numel()],
+                            indices,
+                        )
+                        real = int(buffers.num_token_non_padded)
+                        self.assertEqual(real, int((indices % cp_size == rank).sum()))
+                        torch.testing.assert_close(
+                            buffers.out_cache_loc[: indices.numel()],
+                            batch.out_cache_loc[indices],
+                        )
+                        self.assertTrue(
+                            (buffers.out_cache_loc[indices.numel() :] == 0).all()
+                        )
+                        self.assertTrue(
+                            (buffers.scatter_indices[real:] == 64 // cp_size).all()
+                        )
+                        # Scattering graph padding must never overwrite a real
+                        # token, including row zero on ranks with no tail rows.
+                        local_ids = batch.input_ids[rank::cp_size]
+                        tail_ids = local_ids[buffers.token_indices]
+                        scattered = torch.zeros(
+                            local_ids.numel() + 1, dtype=local_ids.dtype
+                        )
+                        scattered.index_copy_(0, buffers.scatter_indices, tail_ids)
+                        valid_indices = layout["local_token_indices"]
+                        torch.testing.assert_close(
+                            scattered[valid_indices], local_ids[valid_indices]
+                        )
+                        if real == 0:
+                            self.assertTrue((scattered[:-1] == 0).all())
+
+    def test_graph_metadata_refresh_preserves_cp_tail_storage_and_window(self):
+        for rank in range(4):
+            parallel = SimpleNamespace(attn_cp_rank=rank, attn_cp_size=4)
+            backend = object.__new__(DeepseekV4AttnBackend)
+            backend.encoder_replay = False
+            backend._bcg_tail_capacity = 4 * 128
+            backend._bcg_tail_metadata = {}
+            backend.req_to_token = torch.arange(4 * 1024).view(4, 1024).to(torch.int32)
+            backend.page_size, backend.index_topk = 256, 512
+            backend.present_ratios, backend.low_ratios = (0,), ()
+            backend.has_c4 = backend.has_c128 = backend.trtllm_attn = False
+            backend.cuda_int32_kwargs = {"dtype": torch.int32, "device": "cpu"}
+            backend.token_to_kv_pool = SimpleNamespace(
+                request_window=SimpleNamespace(capacity=256)
+            )
+            held = None
+            pointers = None
+            for ext, prefix in [
+                ([41, 159, 85], [0, 384, 0]),
+                ([20, 133], [0, 256]),
+                ([145], [500]),
+            ]:
+                lengths = torch.tensor(ext)
+                positions = torch.cat(
+                    [torch.arange(p, p + n) for p, n in zip(prefix, ext)]
+                )
+                floors = torch.repeat_interleave(torch.tensor(prefix), lengths)
+                backend.encoder_row_floor = floors
+                ids = torch.arange(288, dtype=torch.int64)
+                real_locs = torch.cat(
+                    [
+                        backend.req_to_token[r, p : p + n].long()
+                        for r, p, n in zip([1, 2, 3], prefix, ext)
+                    ]
+                )
+                batch = SimpleNamespace(
+                    input_ids=ids,
+                    positions=torch.nn.functional.pad(
+                        positions, (0, 288 - len(positions))
+                    ),
+                    out_cache_loc=torch.nn.functional.pad(
+                        real_locs, (0, 288 - len(real_locs))
+                    ),
+                    req_pool_indices=torch.arange(1, len(ext) + 1),
+                    batch_size=len(ext),
+                    extend_seq_lens_cpu=ext,
+                    seq_lens_cpu=torch.tensor([p + n for p, n in zip(prefix, ext)]),
+                    seq_lens=torch.tensor([p + n for p, n in zip(prefix, ext)]),
+                    forward_mode=ForwardMode.EXTEND,
+                    attn_cp_metadata=SimpleNamespace(per_rank_actual_token=[72] * 4),
+                )
+                with (
+                    patch(f"{BACKEND}.get_parallel", return_value=parallel),
+                    patch(f"{BACKEND}.is_cp_active", return_value=True),
+                    patch(f"{BACKEND}._create_flashmla_metadata", return_value=None),
+                ):
+                    metadata = backend._prefill_graph_tail_metadata(batch, 1024)
+                if held is not None:
+                    self.assertIs(metadata, held)
+                    self.assertEqual(
+                        pointers,
+                        (
+                            metadata.late_layer_tail.token_indices.data_ptr(),
+                            metadata.late_layer_tail.positions.data_ptr(),
+                            metadata.core_metadata.raw_out_loc.data_ptr(),
+                            metadata.late_layer_tail.cp_metadata.gather_index.data_ptr(),
+                        ),
+                    )
+                held = metadata
+                tail = metadata.late_layer_tail
+                pointers = (
+                    tail.token_indices.data_ptr(),
+                    tail.positions.data_ptr(),
+                    metadata.core_metadata.raw_out_loc.data_ptr(),
+                    tail.cp_metadata.gather_index.data_ptr(),
+                )
+                self.assertEqual(metadata.core_metadata.raw_out_loc.shape, (288,))
+                self.assertEqual(metadata.core_metadata.positions_casual.shape, (72,))
+                self.assertEqual(tail.positions.shape, (72,))
+                self.assertEqual(tail.extend_seq_lens_cpu, [min(128, n) for n in ext])
+                real_global = sum(tail.extend_seq_lens_cpu)
+                self.assertTrue(
+                    (metadata.core_metadata.raw_out_loc[real_global:] == 0).all()
+                )
+                self.assertFalse(
+                    metadata.core_metadata.request_window_layout.commit_mask[
+                        real_global:
+                    ].any()
+                )
+                self.assertTrue(
+                    metadata.core_metadata.request_window_layout.commit_mask[
+                        :real_global
+                    ].all()
+                )
+                self.assertEqual(
+                    int(
+                        metadata.core_metadata.request_window_layout.history_pos.reshape(
+                            4, 128
+                        )[len(ext) - 1, -1]
+                    ),
+                    prefix[-1] + max(0, ext[-1] - 128) - 1,
+                )
+                self.assertEqual(
+                    int(tail.cp_metadata.moe_local_token_count),
+                    sum(tail.local_lens_cpu),
+                )
+
+    def test_graph_tail_logits_drop_padding_and_keep_dspark_token_indices(self):
+        cp_size = 8
+        indices, lengths = torch.tensor([0, 1, 16, 17, 18, 19]), torch.tensor([2, 3, 1])
+        for rank in range(cp_size):
+            with self.subTest(rank=rank):
+                batch = self._batch(cp_size)
+                original_cp = batch.attn_cp_metadata
+                layout = self._layout(batch, indices, lengths, cp_size, rank)
+                buffers = CPTailGraphBuffers.create(
+                    batch, local_rows=8, cp_size=cp_size
+                )
+                meta = buffers.update(batch, indices, lengths, layout, cp_rank=rank)
+                tail = LateLayerTail(
+                    token_indices=buffers.token_indices,
+                    positions=buffers.positions,
+                    extend_seq_lens=lengths,
+                    extend_seq_lens_cpu=lengths.tolist(),
+                    swa_out_cache_loc=buffers.swa_out_cache_loc,
+                    cp_metadata=meta,
+                    scatter_indices=buffers.scatter_indices,
+                    real_rows_count=int(buffers.num_token_non_padded),
+                )
+                logits = Mock(return_value=SimpleNamespace())
+                model = SimpleNamespace(
+                    capture_aux_hidden_states=True,
+                    model=SimpleNamespace(late_layer_start=21),
+                    logits_processor=logits,
+                    lm_head=object(),
+                )
+                outputs = [indices[:, None].float() + i for i in range(4)] + [indices]
+                calls = []
+
+                def gather(value, forward_batch, stream):
+                    self.assertIs(forward_batch.attn_cp_metadata, meta)
+                    n = len(calls)
+                    calls.append(value)
+                    if isinstance(value, tuple):
+                        calls.append(value[1])
+                        return tuple(
+                            torch.cat(
+                                [outputs[i], torch.zeros(8 * cp_size - len(indices), 1)]
+                            )
+                            for i in (0, 1)
+                        )
+                    result = outputs[n]
+                    return torch.cat(
+                        [
+                            result,
+                            result.new_zeros(
+                                (8 * cp_size - len(indices), *result.shape[1:])
+                            ),
+                        ]
+                    )
+
+                local_hidden = torch.ones(8, 1)
+                with (
+                    patch(
+                        f"{MODEL}.get_attn_backend",
+                        return_value=SimpleNamespace(
+                            tail_forward_metadata=SimpleNamespace(late_layer_tail=tail)
+                        ),
+                    ),
+                    patch(
+                        f"{MODEL}.get_parallel",
+                        return_value=SimpleNamespace(
+                            attn_cp_rank=rank, attn_cp_size=cp_size
+                        ),
+                    ),
+                    patch(
+                        f"{MODEL}.LogitsMetadata",
+                        SimpleNamespace(from_forward_batch=lambda _: SimpleNamespace()),
+                    ),
+                    patch("torch.cuda.current_stream", return_value=None),
+                    patch(f"{CP}.cp_gather_after_forward", side_effect=gather),
+                ):
+                    output = DeepseekV4ForCausalLM.logits_from_cp_hidden_states(
+                        model,
+                        (local_hidden, local_hidden),
+                        [local_hidden, local_hidden],
+                        batch,
+                    )
+                self.assertIs(batch.attn_cp_metadata, original_cp)
+                torch.testing.assert_close(output.hidden_states_token_indices, indices)
+                args = logits.call_args.args
+                torch.testing.assert_close(args[0], batch.input_ids[indices])
+                torch.testing.assert_close(args[1], outputs[0])
+                torch.testing.assert_close(args[4][0], outputs[2])
+                torch.testing.assert_close(args[4][1], outputs[3])
 
 
 if __name__ == "__main__":

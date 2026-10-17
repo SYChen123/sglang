@@ -595,9 +595,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ) and should_enable_cp_bcg_capture(server_args)
         if self.enable_cp_bcg_capture:
             if self.max_context_size is not None:
-                # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
-                # metadata preparation before enabling the fixed context limit.
-                self._ignore_max_context_size("CP breakable prefill CUDA graph")
+                # CP builds padded metadata itself. Keep max_seq_len admission,
+                # but do not force the generic fixed-context metadata override.
+                if self.max_seq_len is not None:
+                    self.max_seq_len = min(self.max_seq_len, self.max_context_size)
+                    logger.info(
+                        "CP breakable prefill graph uses max_seq_len=%d for admission",
+                        self.max_seq_len,
+                    )
+                    self.max_context_size = None
+                else:
+                    self._ignore_max_context_size("CP breakable prefill CUDA graph")
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
@@ -764,6 +772,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
+        cp_positions = getattr(forward_batch, "_cp_positions", None)
+        if cp_positions is not None:
+            return cp_positions
         if forward_batch.mrope_positions is None:
             return forward_batch.positions
 
@@ -846,7 +857,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
-                input_ids = forward_batch.input_ids
+                input_ids = getattr(
+                    forward_batch, "_cp_input_ids", forward_batch.input_ids
+                )
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )

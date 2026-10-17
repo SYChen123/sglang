@@ -311,27 +311,21 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     prefill_graph = cfg.cuda_graph_config.prefill
-    cp_breakable_prefill = (
-        cfg.enable_prefill_cp
-        and cfg.cp_strategy == "interleave"
-        and cfg.tp_size > 1
-        and prefill_graph.backend == Backend.BREAKABLE
-    )
-    if (
-        prefill_graph.backend != Backend.DISABLED
-        and prefill_graph.max_seq_len is None
-        and not cp_breakable_prefill
-    ):
+    if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
+        max_seq_len = 16 * 1024
+        if cfg.enable_prefill_cp and prefill_graph.max_context_size is not None:
+            max_seq_len = prefill_graph.max_context_size
         declare_resolution(
             server_args,
             "validate_deepseek_v41_features",
             cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, max_seq_len=16 * 1024
+                cfg.cuda_graph_config, Phase.PREFILL, max_seq_len=max_seq_len
             ),
         )
         logger.warning(
-            "Setting cuda_graph_config[prefill].max_seq_len to 16384 for "
-            "DeepSeek-V4.1; longer contexts run eager prefill."
+            "Setting cuda_graph_config[prefill].max_seq_len to %d for "
+            "DeepSeek-V4.1; longer contexts run eager prefill.",
+            max_seq_len,
         )
 
     if cfg.enable_decoder_swa_bounded_replay:

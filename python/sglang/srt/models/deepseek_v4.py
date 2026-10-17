@@ -727,7 +727,11 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = (
+        query.shape[0]
+        if is_cp_active(forward_batch)
+        else forward_batch.global_num_token_non_padded_cpu
+    )
 
     if real_num_tokens == 0:
         output.zero_()
@@ -737,7 +741,8 @@ def deepseek_v4_attention_with_output(
     key_value = key_value[:real_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    if not is_cp_active(forward_batch):
+        forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
     attn_backend = get_attn_backend()
     try:
@@ -771,7 +776,11 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = (
+        x.shape[0]
+        if is_cp_active(forward_batch)
+        else forward_batch.global_num_token_non_padded_cpu
+    )
     if real_num_tokens == 0:
         return
     get_attn_backend().forward_low_ratio_sources(
@@ -4129,9 +4138,13 @@ class DeepseekV4Model(nn.Module):
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                global_input_ids = forward_batch.input_ids[:total]
+                if is_in_breakable_cuda_graph():
+                    hash_ids = bcg_deepseek_v4_engram_hash_ids(
+                        self.engram_hasher, global_input_ids
+                    )
+                else:
+                    hash_ids = self.engram_hasher(global_input_ids, forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4966,6 +4979,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                 token_indices = cp_gather_after_forward(
                     local_indices, forward_batch, stream
                 )
+                if tail.real_rows_count is not None:
+                    # The graph keeps equal physical shards; logits consume only
+                    # the live request-major tail prefix, including DSpark aux.
+                    n = sum(tail.extend_seq_lens_cpu)
+                    hidden_states, pre_hc_head = hidden_states[:n], pre_hc_head[:n]
+                    token_indices = token_indices[:n]
+                    if torch.is_tensor(aux_hidden_states):
+                        aux_hidden_states = aux_hidden_states[:n]
+                    elif aux_hidden_states is not None:
+                        aux_hidden_states = [aux[:n] for aux in aux_hidden_states]
         finally:
             forward_batch.attn_cp_metadata = saved_cp
 
