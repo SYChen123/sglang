@@ -43,6 +43,19 @@ def prefill_requests(inputs, token_to_kv_pool, req_to_token):
 
     from .scoring import ChunkScores, RequestScores
 
+    backend = envs.SGLANG_DSV41_SM90_PREFILL_INDEXER.get()
+    if backend not in ("triton", "deepgemm"):
+        raise ValueError(
+            "SGLANG_DSV41_SM90_PREFILL_INDEXER must be 'triton' or 'deepgemm'"
+        )
+    scorer = fp8_index_logits_prefill
+    if backend == "deepgemm":
+        from sglang.kernels.ops.attention.dsv4.sm90_deepgemm_prefill import (
+            deepgemm_fp8_index_logits_prefill,
+        )
+
+        scorer = deepgemm_fp8_index_logits_prefill
+
     inputs.reset_outputs()
     counts, seq_lens = inputs.rows_per_request, inputs.seq_lens_cpu
     assert len(counts) == len(seq_lens) == inputs.req_pool_indices.numel()
@@ -67,6 +80,13 @@ def prefill_requests(inputs, token_to_kv_pool, req_to_token):
         slots = req_to_token[req, columns * inputs.compress_ratio].to(torch.int64)
         slots = slots // inputs.compress_ratio
         keys = unpack_fp4_index_keys_to_fp8(slots, table, page_size)
+        # The gather/unpack already applied the FP4 block exponents. DG's
+        # FP8 API wants one FP32 scale per K row, not packed UE8M0 groups.
+        key_scales = (
+            torch.ones(lc, device=keys.device, dtype=torch.float32)
+            if backend == "deepgemm"
+            else None
+        )
         tok = torch.arange(begin, row_base, device=positions.device)
         request = RequestScores(
             lc=lc,
@@ -78,16 +98,28 @@ def prefill_requests(inputs, token_to_kv_pool, req_to_token):
         )
 
         # Consume this iterator before advancing the outer request iterator.
-        def chunks(request=request, keys=keys):
+        def chunks(request=request, keys=keys, key_scales=key_scales):
+            # DG pads full-width cleaned output to ceil((N + 256) / 256)*256.
+            stride = (
+                ((request.lc + 511) // 256) * 256
+                if backend == "deepgemm"
+                else ((request.lc + 3) // 4) * 4
+            )
+            row_alignment = 128 // q.shape[1] if backend == "deepgemm" else 1
             rows_per_chunk = max(
-                1, _SCORE_BUDGET_BYTES // (((request.lc + 3) // 4) * 16)
+                row_alignment,
+                (_SCORE_BUDGET_BYTES // (stride * 4)) // row_alignment * row_alignment,
             )
             for start in range(0, request.tok.numel(), rows_per_chunk):
                 rows = slice(start, start + rows_per_chunk)
                 token_rows = request.tok[rows]
                 q_fp8 = quantize_bf16_index_queries_fp8(q[token_rows])
-                scores = fp8_index_logits_prefill(
-                    q_fp8, weights[token_rows], keys, request.lens[rows]
+                scores = scorer(
+                    q_fp8,
+                    weights[token_rows],
+                    keys,
+                    request.lens[rows],
+                    **({"key_scales": key_scales} if key_scales is not None else {}),
                 )
                 yield ChunkScores(
                     rows=rows,

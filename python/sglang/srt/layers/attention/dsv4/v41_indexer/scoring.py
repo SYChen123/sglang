@@ -1,5 +1,5 @@
 """Index scores shared by the full top-k and both candidate schemes: the DeepGEMM
-operands and flattened-K scores, the torch per-request scores, and the writes of
+operands and flattened-K scores, the Hopper/Torch per-request scores, and the writes of
 a selection back into pool slots."""
 
 from __future__ import annotations
@@ -282,7 +282,7 @@ class ChunkScores(msgspec.Struct, frozen=True):
     rows: slice  # into the request's rows
     tok: torch.Tensor
     lens: torch.Tensor
-    scores: torch.Tensor  # [rows, lc] bf16, -inf past each row's length
+    scores: torch.Tensor  # [rows, lc] logits, -inf past each row's length
     use_ragged_topk: bool = False
 
 

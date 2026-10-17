@@ -1,5 +1,5 @@
 """The full top-k of the ratio-1/2 index layers outside the candidate scheme:
-DeepGEMM on SM100, torch elsewhere."""
+FP4 DeepGEMM on SM100, FP8 prefill on Hopper, torch as fallback."""
 
 from __future__ import annotations
 

@@ -212,7 +212,7 @@ class DenseBlocksBackend:
         )
         data.write_selection(selected, inputs)
 
-    # ---------- torch: per-request scores ----------
+    # ---------- per-request scores: Hopper FP8 or torch ----------
 
     def _torch_publish_prefill(self, inputs: PrefillInputs):
         picked = []  # (query rows, their block ids) per scored chunk

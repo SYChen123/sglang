@@ -451,3 +451,14 @@ register_kernel(
         ),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="attention.deepgemm_fp8_index_logits_prefill",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.attention.dsv4.sm90_deepgemm_prefill:deepgemm_fp8_index_logits_prefill",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 9))}
+        ),
+    )
+)
