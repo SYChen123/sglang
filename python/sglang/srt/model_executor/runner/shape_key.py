@@ -28,3 +28,5 @@ class ShapeKey:
     variant_label: Optional[str] = None
     # Independent attention variant (DSA dense/sparse, candidate_*); None is default.
     attention_variant: Optional[str] = None
+    # Independent CP-local decoder shape within a prefill BCG body.
+    decoder_tail_local_rows: Optional[int] = None

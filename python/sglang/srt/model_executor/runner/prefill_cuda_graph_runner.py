@@ -494,6 +494,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
+        self._decoder_tail_local_variants: Dict[int, tuple[int, ...]] = {}
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -1080,7 +1081,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     "prefix batch has no captured FullCG variant"
                 )
                 variant = _chunked_prefix_variant(captured_n)
-        return ShapeKey(size=num_tokens, variant_label=variant)
+        return ShapeKey(
+            size=num_tokens,
+            variant_label=variant,
+            decoder_tail_local_rows=getattr(
+                forward_batch, "prefill_decoder_tail_local_rows", None
+            ),
+        )
+
+    def _bind_decoder_tail_variant(
+        self, num_tokens: int, forward_batch: ForwardBatch
+    ) -> None:
+        variants = self._decoder_tail_local_variants.get(num_tokens)
+        if variants is None:
+            return
+        needed = self.model_runner.attn_backend.prefill_cuda_graph_tail_local_rows(
+            forward_batch
+        )
+        forward_batch.prefill_decoder_tail_local_rows = next(
+            rows for rows in variants if rows >= needed
+        )
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
@@ -1703,7 +1723,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         prefix_num_chunks=captured_n,
                     )
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self,
+        size: int,
+        *,
+        prefix_num_chunks: int = 0,
+        decoder_tail_local_rows: Optional[int] = None,
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
@@ -1717,6 +1743,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 static_num_tokens=num_tokens,
                 capture=True,
             )
+            if decoder_tail_local_rows is None:
+                variants = attn_backend.prefill_cuda_graph_tail_local_buckets(
+                    forward_batch
+                )
+                if variants is not None:
+                    self._decoder_tail_local_variants[num_tokens] = variants
+                    # Largest first: output/workspace capacity is established
+                    # before capturing smaller decoder shapes of the same body.
+                    for local_rows in reversed(variants):
+                        self.capture_one_shape(
+                            size,
+                            prefix_num_chunks=prefix_num_chunks,
+                            decoder_tail_local_rows=local_rows,
+                        )
+                    return
+        forward_batch.prefill_decoder_tail_local_rows = decoder_tail_local_rows
         if forward_batch.lora_ids is not None:
             # Fill the static prefill LoRA batch info the captured kernels
             # will read (all-None ids: ranks stay 0, kernels no-op).
@@ -1729,6 +1771,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             lora_manager.prepare_lora_batch(forward_batch)
         shape_key = ShapeKey(
             size=num_tokens,
+            decoder_tail_local_rows=decoder_tail_local_rows,
             variant_label=(
                 _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
@@ -2072,9 +2115,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 static_num_tokens=static_num_tokens,
                 capture=False,
             )
+            self._bind_decoder_tail_variant(static_num_tokens, static_forward_batch)
             metadata_forward_batch = static_forward_batch
 
-        shape_key = self._shape_key(static_num_tokens, forward_batch)
+        shape_key = self._shape_key(static_num_tokens, metadata_forward_batch)
         self._prepare_forward_metadata_for_replay(
             metadata_forward_batch, static_forward_batch, shape_key
         )
@@ -2275,7 +2319,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
-            shape_key = self._shape_key(static_num_tokens, forward_batch)
+            shape_key = self._shape_key(
+                static_num_tokens,
+                static_forward_batch if self.enable_cp_bcg_capture else forward_batch,
+            )
             # The only variants this runner records are chunked-prefix ones.
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)

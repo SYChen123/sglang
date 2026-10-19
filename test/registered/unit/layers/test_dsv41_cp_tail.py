@@ -430,6 +430,11 @@ class TestDSV41CPTailGraph(CustomTestCase):
                             self.assertTrue((scattered[:-1] == 0).all())
 
     def test_graph_metadata_refresh_preserves_cp_tail_storage_and_window(self):
+        for local_rows in (None, 68):
+            with self.subTest(local_rows=local_rows):
+                self._check_graph_metadata_refresh(local_rows)
+
+    def _check_graph_metadata_refresh(self, local_rows):
         for rank in range(4):
             parallel = SimpleNamespace(attn_cp_rank=rank, attn_cp_size=4)
             backend = object.__new__(DeepseekV4AttnBackend)
@@ -466,6 +471,7 @@ class TestDSV41CPTailGraph(CustomTestCase):
                 )
                 batch = SimpleNamespace(
                     input_ids=ids,
+                    prefill_decoder_tail_local_rows=local_rows,
                     positions=torch.nn.functional.pad(
                         positions, (0, 288 - len(positions))
                     ),
@@ -505,9 +511,14 @@ class TestDSV41CPTailGraph(CustomTestCase):
                     metadata.core_metadata.raw_out_loc.data_ptr(),
                     tail.cp_metadata.gather_index.data_ptr(),
                 )
-                self.assertEqual(metadata.core_metadata.raw_out_loc.shape, (288,))
-                self.assertEqual(metadata.core_metadata.positions_casual.shape, (72,))
-                self.assertEqual(tail.positions.shape, (72,))
+                physical = 72 if local_rows is None else local_rows
+                self.assertEqual(
+                    metadata.core_metadata.raw_out_loc.shape, (physical * 4,)
+                )
+                self.assertEqual(
+                    metadata.core_metadata.positions_casual.shape, (physical,)
+                )
+                self.assertEqual(tail.positions.shape, (physical,))
                 self.assertEqual(tail.extend_seq_lens_cpu, [min(128, n) for n in ext])
                 real_global = sum(tail.extend_seq_lens_cpu)
                 self.assertTrue(
@@ -624,6 +635,126 @@ class TestDSV41CPTailGraph(CustomTestCase):
                 torch.testing.assert_close(args[1], outputs[0])
                 torch.testing.assert_close(args[4][0], outputs[2])
                 torch.testing.assert_close(args[4][1], outputs[3])
+
+
+class TestDSV41CPTailBuckets(CustomTestCase):
+    def test_three_requests_use_96_local_rows_in_the_8192_encoder_bucket(self):
+        """BS3 must not inherit the max64 request tail (2048 local rows)."""
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend._bcg_tail_capacity = 8192
+        batch = SimpleNamespace(
+            prefill_decoder_tail_local_rows=96,
+            attn_cp_metadata=SimpleNamespace(per_rank_actual_token=[2048] * 4),
+        )
+        with (
+            patch(f"{BACKEND}.is_cp_active", return_value=True),
+            patch(
+                f"{BACKEND}.get_parallel", return_value=SimpleNamespace(attn_cp_size=4)
+            ),
+        ):
+            self.assertEqual(backend._prefill_graph_tail_block_rows(batch), 384)
+
+    def test_cpu_dispatch_covers_short_tails_with_the_same_cp_owner(self):
+        from sglang.srt.layers.attention.dsv4.cp_bcg import (
+            cp_tail_local_buckets,
+            cp_tail_local_rows,
+        )
+
+        for cp_size in (2, 4, 8):
+            # The first case has multiple short tails with the same owner;
+            # ceil(aggregate / CP) alone underestimates that rank's rows.
+            for lengths in ([1, 131, 1], [41, 159, 85], [4096] * 3, [1]):
+                indices, offset = [], 0
+                for n in lengths:
+                    indices.extend(range(offset + n - min(128, n), offset + n))
+                    offset += n
+                expected = max(
+                    sum(i % cp_size == rank for i in indices) for rank in range(cp_size)
+                )
+                self.assertEqual(
+                    cp_tail_local_rows(lengths, window=128, cp_size=cp_size), expected
+                )
+                capacity = 64 * ((128 + cp_size - 1) // cp_size)
+                buckets = cp_tail_local_buckets(capacity, window=128, cp_size=cp_size)
+                selected = next(n for n in buckets if n >= expected)
+                self.assertGreaterEqual(selected, expected)
+                if lengths == [4096] * 3:
+                    self.assertEqual(selected, 384 // cp_size)
+
+    def test_attention_reads_only_live_rows_and_zeros_static_bridge_padding(self):
+        for tail_rows in ([32, 32, 32], None, []):
+            with self.subTest(tail_rows=tail_rows):
+                live = 96 if tail_rows else (3 if tail_rows is None else 0)
+                query = torch.arange(128 * 2).reshape(128, 1, 2).float()
+                output = torch.full_like(query, float("nan"))
+                tail = (
+                    None
+                    if tail_rows is None
+                    else SimpleNamespace(local_lens_cpu=tail_rows)
+                )
+                batch = SimpleNamespace(
+                    extend_seq_lens_cpu=[11], out_cache_loc=torch.arange(16)
+                )
+
+                def attention(**kwargs):
+                    self.assertEqual(kwargs["q"].shape[0], live)
+                    self.assertEqual(kwargs["k"].shape[0], live)
+                    return kwargs["q"] + 5
+
+                backend = SimpleNamespace(
+                    forward_metadata=SimpleNamespace(late_layer_tail=tail),
+                    forward=attention,
+                )
+                with (
+                    patch(f"{MODEL}.is_cp_active", return_value=True),
+                    patch(
+                        f"{MODEL}.get_parallel",
+                        return_value=SimpleNamespace(attn_cp_rank=0, attn_cp_size=4),
+                    ),
+                    patch(f"{MODEL}.get_attn_backend", return_value=backend),
+                    patch(
+                        f"{MODEL}.get_tc_piecewise_forward_context",
+                        return_value=SimpleNamespace(
+                            forward_batch=batch, attention_layers=[object()]
+                        ),
+                    ),
+                ):
+                    # Exercise the actual registered Python implementation;
+                    # its tensor math runs on CPU with a stub attention backend.
+                    torch.ops.sglang.deepseek_v4_attention_with_output.default.redispatch(
+                        torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA),
+                        query,
+                        query,
+                        output,
+                        0,
+                        0,
+                        torch.zeros(1),
+                        False,
+                    )
+                torch.testing.assert_close(output[:live], query[:live] + 5)
+                self.assertTrue((output[live:] == 0).all())
+
+    def test_empty_query_rank_still_commits_the_global_window(self):
+        backend = object.__new__(DeepseekV4AttnBackend)
+        commits = []
+        backend.head_dim_v = 2
+        backend.trtllm_attn = False
+        backend.is_dspark_draft = False
+        backend.token_to_kv_pool = SimpleNamespace(
+            request_window=SimpleNamespace(commit=commits.append),
+            _swa_local_layer_id=lambda layer: layer,
+        )
+        backend._forward_attention = Mock(
+            side_effect=AssertionError("empty attention kernel")
+        )
+        q = torch.empty(0, 1, 2)
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        with patch(f"{BACKEND}.is_cp_active", return_value=True):
+            output = backend.forward(
+                q, q, q, SimpleNamespace(layer_id=21), batch, save_kv_cache=False
+            )
+        self.assertEqual(output.shape, q.shape)
+        self.assertEqual(commits, [21])
 
 
 if __name__ == "__main__":

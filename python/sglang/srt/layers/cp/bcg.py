@@ -361,7 +361,12 @@ def execute_prefill_cp_bcg(
         raw_num_tokens=raw_num_tokens,
     ):
         local_output = runner.backend.replay(
-            ShapeKey(size=static_num_tokens),
+            ShapeKey(
+                size=static_num_tokens,
+                decoder_tail_local_rows=getattr(
+                    static_forward_batch, "prefill_decoder_tail_local_rows", None
+                ),
+            ),
             static_forward_batch,
             **kwargs,
         )

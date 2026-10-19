@@ -68,7 +68,10 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
-from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
+from sglang.srt.layers.cp.interleave import (
+    attn_cp_interleave_gather,
+    interleave_rows_per_request,
+)
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
@@ -727,13 +730,25 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = (
-        query.shape[0]
-        if is_cp_active(forward_batch)
-        else forward_batch.global_num_token_non_padded_cpu
-    )
+    attn_backend = get_attn_backend()
+    if is_cp_active(forward_batch):
+        tail = attn_backend.forward_metadata.late_layer_tail
+        if tail is not None:
+            real_num_tokens = sum(tail.local_lens_cpu)
+        else:
+            parallel = get_parallel()
+            real_num_tokens = sum(
+                interleave_rows_per_request(
+                    forward_batch.extend_seq_lens_cpu,
+                    parallel.attn_cp_rank,
+                    parallel.attn_cp_size,
+                )
+            )
+    else:
+        real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    assert 0 <= real_num_tokens <= query.shape[0]
 
-    if real_num_tokens == 0:
+    if real_num_tokens == 0 and not is_cp_active(forward_batch):
         output.zero_()
         return
 
@@ -744,7 +759,6 @@ def deepseek_v4_attention_with_output(
     if not is_cp_active(forward_batch):
         forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
-    attn_backend = get_attn_backend()
     try:
         ret = attn_backend.forward(
             q=query,

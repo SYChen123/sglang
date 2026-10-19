@@ -8,6 +8,41 @@ import torch
 from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
 
 
+def cp_tail_local_rows(extend_lens, *, window: int, cp_size: int) -> int:
+    """Largest rank share of tails in the original interleave order.
+
+    Dividing the aggregate by CP misses short tails with the same owner.
+    CPU-only selection also avoids a GPU sync on every graph dispatch.
+    """
+    counts = [0] * cp_size
+    end = 0
+    for length in extend_lens:
+        end += int(length)
+        start = end - min(window, int(length))
+        for rank in range(cp_size):
+            counts[rank] += (end + cp_size - 1 - rank) // cp_size - (
+                start + cp_size - 1 - rank
+            ) // cp_size
+    return max(counts)
+
+
+def cp_tail_local_buckets(
+    capacity: int, *, window: int, cp_size: int
+) -> tuple[int, ...]:
+    """Geometric shapes plus the common three-request prefill shape.
+
+    Retain the capacity ceiling for large batches. Encoder tokens are an
+    independent axis and do not change when selecting a smaller tail.
+    """
+    step = (window + cp_size - 1) // cp_size
+    buckets = {capacity, min(capacity, 3 * step)}
+    rows = step
+    while rows < capacity:
+        buckets.add(rows)
+        rows *= 2
+    return tuple(sorted(buckets))
+
+
 @dataclass
 class CPTailGraphBuffers:
     token_indices: torch.Tensor

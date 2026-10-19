@@ -155,6 +155,17 @@ class AttentionBackend(ABC):
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
+    def prefill_cuda_graph_tail_local_buckets(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[tuple[int, ...]]:
+        """Optional CP-local tail variants sharing the encoder token bucket."""
+        return None
+
+    def prefill_cuda_graph_tail_local_rows(self, forward_batch: ForwardBatch) -> int:
+        """Largest live CP-local tail needed by this batch, on every rank."""
+        raise NotImplementedError
+
     # Most requests one replay of that captured metadata can carry (None: no
     # bound). Fixed at init: the dp-attention replay vote checks it too.
     prefill_cuda_graph_max_batch_size: Optional[int] = None

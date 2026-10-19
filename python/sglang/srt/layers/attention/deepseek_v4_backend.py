@@ -1205,6 +1205,7 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_capacity: Optional[int] = None
         self._bcg_tail_buffers: Optional[tuple] = None
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
+        self._bcg_cp_encoder_metadata: Dict[int, DSV4Metadata] = {}
         self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
@@ -1598,6 +1599,35 @@ class DeepseekV4AttnBackend(
             self._bcg_tail_capacity = int(max_reqs) * SWA_WINDOW
         return self._bcg_tail_capacity
 
+    def prefill_cuda_graph_tail_local_rows(self, forward_batch: ForwardBatch) -> int:
+        from sglang.srt.layers.attention.dsv4.cp_bcg import cp_tail_local_rows
+
+        return cp_tail_local_rows(
+            forward_batch.extend_seq_lens_cpu,
+            window=SWA_WINDOW,
+            cp_size=get_parallel().attn_cp_size,
+        )
+
+    def prefill_cuda_graph_tail_local_buckets(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[tuple[int, ...]]:
+        if not self.enable_decoder_swa_bounded_replay or not is_cp_active(
+            forward_batch
+        ):
+            return None
+        from sglang.srt.layers.attention.dsv4.cp_bcg import cp_tail_local_buckets
+
+        cp_size = get_parallel().attn_cp_size
+        capacity = self._prefill_graph_tail_block_rows(forward_batch) // cp_size
+        needed = self.prefill_cuda_graph_tail_local_rows(forward_batch)
+        return tuple(
+            rows
+            for rows in cp_tail_local_buckets(
+                capacity, window=SWA_WINDOW, cp_size=cp_size
+            )
+            if rows >= needed
+        )
+
     def _prefill_graph_tail_block_rows(self, forward_batch: ForwardBatch) -> int:
         """Tail block rows for the captured shape this batch is padded to: the
         shape's token count, capped at the request-cap capacity."""
@@ -1610,6 +1640,10 @@ class DeepseekV4AttnBackend(
                 (SWA_WINDOW + cp_size - 1) // cp_size
             )
             local_rows = max(forward_batch.attn_cp_metadata.per_rank_actual_token)
+            selected = getattr(forward_batch, "prefill_decoder_tail_local_rows", None)
+            if selected is not None:
+                assert 0 < selected <= min(per_rank_cap, local_rows)
+                return selected * cp_size
             return min(per_rank_cap, local_rows) * cp_size
         return min(capacity, int(forward_batch.out_cache_loc.shape[0]))
 
@@ -2932,6 +2966,16 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        if getattr(forward_batch, "prefill_decoder_tail_local_rows", None) is not None:
+            # Tail variants share full-encoder metadata addresses and its large
+            # context tables. Only the compact tail has independent geometry.
+            encoder_rows = forward_batch.input_ids.shape[0]
+            held = self._bcg_cp_encoder_metadata.get(encoder_rows)
+            if held is None:
+                self._bcg_cp_encoder_metadata[encoder_rows] = self.forward_metadata
+            else:
+                held.refresh_for_breakable_cuda_graph_replay_(self.forward_metadata)
+                self.forward_metadata = held
         with_tail = (
             self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -3827,7 +3871,24 @@ class DeepseekV4AttnBackend(
         )
 
     def forward(self, q, k, v, layer, forward_batch, *args, **kwargs):
-        result = self._forward_attention(q, k, v, layer, forward_batch, *args, **kwargs)
+        if (
+            q.shape[0] == 0
+            and forward_batch.forward_mode.is_extend()
+            and is_cp_active(forward_batch)
+        ):
+            # This rank can own no query rows while every rank still writes
+            # and commits the globally gathered window KV. Skip the attention
+            # kernel, but retain the commit below (including on empty ranks).
+            if kwargs.get("save_kv_cache", True):
+                self.store_cache(layer.layer_id, k, forward_batch)
+            result = q.new_empty(
+                (*q.shape[:-1], self.head_dim_v),
+                dtype=torch.bfloat16 if self.trtllm_attn else q.dtype,
+            )
+        else:
+            result = self._forward_attention(
+                q, k, v, layer, forward_batch, *args, **kwargs
+            )
         window = self.token_to_kv_pool.request_window
         if (
             window is not None
