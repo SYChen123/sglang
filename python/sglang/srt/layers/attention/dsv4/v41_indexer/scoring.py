@@ -284,6 +284,7 @@ class ChunkScores(msgspec.Struct, frozen=True):
     lens: torch.Tensor
     scores: torch.Tensor  # [rows, lc] logits, -inf past each row's length
     use_ragged_topk: bool = False
+    candidate_blocks: Optional[torch.Tensor] = None  # compact columns -> logical K
 
 
 class DecodeScores(msgspec.Struct, frozen=True):
@@ -299,13 +300,21 @@ def prefill_requests(
     inputs: PrefillInputs,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    candidate_block_size: int = 8,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
     """Requests with nothing visible yet are skipped."""
     from .sm90_prefill import prefill_requests as sm90_requests
     from .sm90_prefill import use_sm90_prefill
 
     if use_sm90_prefill(inputs):
-        yield from sm90_requests(inputs, token_to_kv_pool, req_to_token)
+        yield from sm90_requests(
+            inputs,
+            token_to_kv_pool,
+            req_to_token,
+            candidate_blocks=candidate_blocks,
+            candidate_block_size=candidate_block_size,
+        )
         return
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio

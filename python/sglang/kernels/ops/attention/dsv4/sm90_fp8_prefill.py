@@ -148,6 +148,7 @@ def _fp8_index_logits_prefill_kernel(
     w_ptr,  # [B, H] bf16
     k_ptr,  # [L, D] e4m3
     lens_ptr,  # [B] int64
+    blocks_ptr,  # optional [B, NUM_BLOCKS] int32 logical block ids
     out_ptr,  # [B, OUT_L] fp32
     L,
     OUT_L,
@@ -155,9 +156,13 @@ def _fp8_index_logits_prefill_kernel(
     stride_qh,
     stride_kl,
     stride_wb,
+    stride_blocks,
     H: tl.constexpr,
     D: tl.constexpr,
     BLOCK_L: tl.constexpr,
+    USE_CANDIDATES: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    CANDIDATE_BLOCK_SIZE: tl.constexpr,
 ):
     b = tl.program_id(0)
     lb = tl.program_id(1)
@@ -165,10 +170,20 @@ def _fp8_index_logits_prefill_kernel(
     offs_h = tl.arange(0, H)
     offs_d = tl.arange(0, D)
     n_vis = tl.load(lens_ptr + b)
-    valid = offs_l < tl.minimum(n_vis, L)
+    logical = offs_l
+    if USE_CANDIDATES:
+        block = tl.load(
+            blocks_ptr + b * stride_blocks + offs_l // CANDIDATE_BLOCK_SIZE,
+            mask=offs_l < NUM_BLOCKS * CANDIDATE_BLOCK_SIZE,
+            other=-1,
+        )
+        logical = block * CANDIDATE_BLOCK_SIZE + offs_l % CANDIDATE_BLOCK_SIZE
+        valid = (block >= 0) & (logical < tl.minimum(n_vis, L))
+    else:
+        valid = offs_l < tl.minimum(n_vis, L)
     q = tl.load(q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :])
     k = tl.load(
-        k_ptr + offs_l[:, None] * stride_kl + offs_d[None, :],
+        k_ptr + logical[:, None] * stride_kl + offs_d[None, :],
         mask=valid[:, None],
         other=0.0,
     )
@@ -188,19 +203,31 @@ def fp8_index_logits_prefill(
     weights: torch.Tensor,
     keys: torch.Tensor,
     lens: torch.Tensor,
+    *,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 8,
 ) -> torch.Tensor:
     """Score E4M3 queries against E4M3 keys with FP32 accumulation.
 
     Rows have a four-float-aligned storage stride for ragged top-k. The returned
-    view keeps the logical width for candidate masks; backing padding is -inf.
+    view keeps the logical width; backing padding is -inf. With candidates,
+    column j scores K[blocks[row, j // block_size] * block_size + j % block_size].
+    Each row owns its block list; holes and causally invisible positions are -inf.
     """
     assert q.dtype == torch.float8_e4m3fn and q.shape[-1] == INDEX_HEAD_DIM
     rows, heads, _ = q.shape
     assert heads in (32, 64)
-    width = keys.shape[0]
+    key_width = keys.shape[0]
+    width = key_width
     assert keys.dtype == torch.float8_e4m3fn and keys.shape[1:] == (INDEX_HEAD_DIM,)
     assert weights.shape == (rows, heads)
     assert lens.shape == (rows,)
+    if candidate_blocks is not None:
+        assert candidate_blocks.ndim == 2 and candidate_blocks.shape[0] == rows
+        assert candidate_blocks.dtype == torch.int32
+        assert candidate_block_size in (1, 2, 4, 8, 16, 32, 64)
+        assert candidate_blocks.stride(1) == 1
+        width = candidate_blocks.shape[1] * candidate_block_size
     q = q.contiguous()
     weights = weights.to(torch.bfloat16).contiguous()
     keys = keys.contiguous()
@@ -215,16 +242,21 @@ def fp8_index_logits_prefill(
         weights,
         keys,
         lens.to(torch.int64).contiguous(),
+        candidate_blocks,
         out,
-        width,
+        key_width,
         out_width,
         q.stride(0),
         q.stride(1),
         keys.stride(0),
         weights.stride(0),
+        candidate_blocks.stride(0) if candidate_blocks is not None else 0,
         H=heads,
         D=INDEX_HEAD_DIM,
         BLOCK_L=block_l,
+        USE_CANDIDATES=candidate_blocks is not None,
+        NUM_BLOCKS=candidate_blocks.shape[1] if candidate_blocks is not None else 0,
+        CANDIDATE_BLOCK_SIZE=candidate_block_size,
         num_warps=4,
     )
     return out

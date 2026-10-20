@@ -194,6 +194,126 @@ class TestSM90Prefill(CustomTestCase):
                     visible = min(8, (int(positions[row]) + 1) // ratio)
                     self.assertEqual(set(raw[row].tolist()) - {-1}, set(range(visible)))
 
+    def test_compact_scores_per_query_holes_partial_blocks_and_graph_replay(self):
+        """Candidate columns retain dense scores as row mappings and lengths change."""
+        for heads in (32, 64):
+            table, values = packed_keys(259)
+            keys = unpack_fp4_index_keys_to_fp8(
+                torch.arange(259, device="cuda"), table, 16
+            )
+            q = quantize_bf16_index_queries_fp8(
+                values[torch.randint(0, 259, (5, heads), device="cuda")]
+            )
+            weights = torch.randn(5, heads, device="cuda").bfloat16()
+            lens = torch.tensor([0, 1, 63, 258, 259], device="cuda", dtype=torch.int32)
+            # Different candidates for every Q, unordered, with interior holes,
+            # a partial final block, and an out-of-range positive block id.
+            blocks = torch.tensor(
+                [[0, -1, 1], [0, 2, -1], [7, -1, 0], [32, 1, 9], [3, 32, 100]],
+                device="cuda",
+                dtype=torch.int32,
+            )
+
+            def score():
+                return fp8_index_logits_prefill(
+                    q, weights, keys, lens, candidate_blocks=blocks
+                )
+
+            for _ in range(2):
+                score()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = score()
+            for replay in range(2):
+                if replay:
+                    blocks.copy_(blocks.flip(0))
+                    lens.copy_(torch.tensor([259, 63, 0, 1, 258], device="cuda"))
+                graph.replay()
+                dense = fp8_index_logits_prefill(q, weights, keys, lens)
+                logical = (
+                    blocks[:, :, None].long() * 8
+                    + torch.arange(8, device="cuda")[None, None, :]
+                ).flatten(1)
+                valid = (blocks >= 0).repeat_interleave(8, 1)
+                valid &= logical < lens[:, None]
+                valid &= logical < keys.shape[0]
+                reference = dense.gather(1, logical.clamp(0, 258)).masked_fill(
+                    ~valid, -torch.inf
+                )
+                torch.testing.assert_close(captured, reference, rtol=0, atol=0)
+                self.assertEqual(captured.shape, (5, 24))
+
+    def test_compact_cp_tail_maps_distinct_candidates_to_pool_slots(self):
+        """A bounded CP tail uses its published rows, never padded encoder rows."""
+        table, values = packed_keys(4 * 512)
+        req_table = torch.randperm(4 * 512, device="cuda").view(4, 512)
+        pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda _: table)
+        raw = torch.full((5, 16), 999, dtype=torch.int32, device="cuda")
+        positions = torch.tensor([80, 90, 258, 0, 0], device="cuda")
+        inputs = PrefillInputs(
+            indexer=SimpleNamespace(
+                index_topk=16,
+                index_head_dim=128,
+                n_local_heads=32,
+                queries=lambda q, freqs: q,
+                head_weights=lambda x: x,
+            ),
+            layer_id=0,
+            compress_ratio=1,
+            freqs_cis=torch.ones(512, 1, device="cuda"),
+            x=torch.randn(5, 32, device="cuda").bfloat16(),
+            q_lora=values[torch.randint(0, 100, (5, 32), device="cuda")],
+            positions=positions,
+            req_rows=None,
+            req_pool_indices=torch.tensor([3, 1, 2], device="cuda"),
+            kv_page_table=torch.empty(0, device="cuda"),
+            seq_lens_cpu=[91, 128, 259],
+            rows_per_request=[2, 0, 1],
+            rows_per_request_device=torch.tensor([2, 0, 1], device="cuda"),
+            out_raw_indices=raw,
+            out_page_indices=raw.clone(),
+        )
+        # Encoder rows per request were [3,0,2]; only their tails reach decoder.
+        published = BlockIds(
+            blocks=torch.tensor(
+                [[9, 10], [5, -1], [2, 7], [1, -1], [32, 3]],
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            rows_per_request=[3, 0, 2],
+        ).tail([2, 0, 1])
+        backend = DenseBlocksBackend(
+            token_to_kv_pool=pool,
+            req_to_token=req_table,
+            candidate_topk_blocks=2,
+            candidate_block_size=8,
+            use_deep_gemm_prefill=False,
+        )
+        for mode in ("triton", "auto"):
+            with (
+                envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(False),
+                envs.SGLANG_DSV41_SM90_PREFILL_INDEXER.override(mode),
+                envs.SGLANG_DSV41_SM90_PREFILL_INDEXER_DEEPGEMM_MIN_ROWS.override(128),
+            ):
+                backend.consume_prefill(inputs, published)
+                for row, req in enumerate((3, 3, 2)):
+                    candidates = {
+                        block * 8 + offset
+                        for block in published.blocks[row].tolist()
+                        for offset in range(8)
+                        if block >= 0 and block * 8 + offset <= int(positions[row])
+                    }
+                    picked = raw[row][raw[row] >= 0].long()
+                    self.assertEqual(set(picked.tolist()), candidates)
+                    self.assertTrue(
+                        torch.equal(
+                            inputs.out_page_indices[row, : picked.numel()].long(),
+                            req_table[req, picked],
+                        )
+                    )
+                self.assertTrue((raw[3:] == -1).all())
+                self.assertTrue((inputs.out_page_indices[3:] == -1).all())
+
 
 if __name__ == "__main__":
     unittest.main()

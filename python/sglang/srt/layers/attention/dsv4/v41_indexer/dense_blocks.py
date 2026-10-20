@@ -256,8 +256,37 @@ class DenseBlocksBackend:
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            candidate_blocks=published.blocks,
+            candidate_block_size=self.block_size,
         ):
             for chunk in chunks:
+                if chunk.candidate_blocks is not None:
+                    # Compact columns can contain holes: use the complete
+                    # compact width for Top-K, then reject -inf selections.
+                    width = chunk.scores.shape[1]
+                    if width == 0:
+                        continue
+                    idx = torch.empty(
+                        (chunk.scores.shape[0], request.k),
+                        dtype=torch.int32,
+                        device=chunk.scores.device,
+                    )
+                    topk_ragged(
+                        chunk.scores,
+                        torch.full_like(chunk.lens, width),
+                        out=idx,
+                        offsets=torch.zeros_like(chunk.lens),
+                    )
+                    selected = idx.long().clamp(0, width - 1)
+                    valid = (idx >= 0) & (chunk.scores.gather(1, selected) > -torch.inf)
+                    blocks = chunk.candidate_blocks.gather(
+                        1, selected // self.block_size
+                    )
+                    logical = blocks * self.block_size + selected % self.block_size
+                    write_prefill(
+                        inputs, request, chunk, logical.masked_fill(~valid, -1)
+                    )
+                    continue
                 if chunk.use_ragged_topk:
                     keep = candidate_block_mask(
                         published.blocks[chunk.tok], request.lc, self.block_size

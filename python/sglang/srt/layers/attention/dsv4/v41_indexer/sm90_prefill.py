@@ -34,7 +34,14 @@ def use_sm90_prefill(inputs: PrefillInputs) -> bool:
     )
 
 
-def prefill_requests(inputs, token_to_kv_pool, req_to_token):
+def prefill_requests(
+    inputs,
+    token_to_kv_pool,
+    req_to_token,
+    *,
+    candidate_blocks=None,
+    candidate_block_size=8,
+):
     from sglang.kernels.ops.attention.dsv4.sm90_fp8_prefill import (
         fp8_index_logits_prefill,
         quantize_bf16_index_queries_fp8,
@@ -62,6 +69,8 @@ def prefill_requests(inputs, token_to_kv_pool, req_to_token):
     counts, seq_lens = inputs.rows_per_request, inputs.seq_lens_cpu
     assert len(counts) == len(seq_lens) == inputs.req_pool_indices.numel()
     real_rows = sum(counts)
+    if candidate_blocks is not None:
+        assert candidate_blocks.shape[0] >= real_rows, "candidate query mapping changed"
     if real_rows == 0:
         return
     assert real_rows <= inputs.positions.numel()
@@ -115,6 +124,7 @@ def prefill_requests(inputs, token_to_kv_pool, req_to_token):
                 use_deepgemm = backend == "deepgemm" or (
                     backend == "auto" and q_fp8.shape[0] >= min_deepgemm_rows
                 )
+                compact_blocks = None
                 if use_deepgemm:
                     if key_scales is None:
                         # FP4 block exponents were applied during gather. DG
@@ -130,8 +140,15 @@ def prefill_requests(inputs, token_to_kv_pool, req_to_token):
                         key_scales=key_scales,
                     )
                 else:
+                    if candidate_blocks is not None:
+                        compact_blocks = candidate_blocks[token_rows]
                     scores = fp8_index_logits_prefill(
-                        q_fp8, weights[token_rows], keys, request.lens[rows]
+                        q_fp8,
+                        weights[token_rows],
+                        keys,
+                        request.lens[rows],
+                        candidate_blocks=compact_blocks,
+                        candidate_block_size=candidate_block_size,
                     )
                 yield ChunkScores(
                     rows=rows,
@@ -139,6 +156,7 @@ def prefill_requests(inputs, token_to_kv_pool, req_to_token):
                     lens=request.lens[rows],
                     scores=scores,
                     use_ragged_topk=True,
+                    candidate_blocks=compact_blocks,
                 )
 
         yield request, chunks()
