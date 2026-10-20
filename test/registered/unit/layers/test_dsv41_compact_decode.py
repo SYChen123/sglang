@@ -67,6 +67,32 @@ def fake_topk(scores, lens, page_table, out, page_size, plan):
 
 
 class TestCompactDecode(CustomTestCase):
+    def test_chunks_fit_aligned_score_and_source_block_allocations(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.compact_decode import (
+            _score_rows_per_chunk,
+        )
+
+        budget = 128 << 20
+        reserve = 8 << 20
+        for width in (259, 16384, 1048580):
+            for block_size in (None, 1, 2, 8, 64):
+                with self.subTest(width=width, block_size=block_size):
+                    rows = _score_rows_per_chunk(width, block_size=block_size)
+                    # Allocate actual padded row layouts, independently of the
+                    # budget helper, so changing either alignment is caught.
+                    logits = torch.empty(
+                        rows, ((width + 31) // 32) * 32, dtype=torch.float32
+                    )
+                    nbytes = logits.numel() * logits.element_size()
+                    if block_size is not None:
+                        blocks = (width + block_size - 1) // block_size
+                        maxima = torch.empty(
+                            rows, ((blocks + 3) // 4) * 4, dtype=torch.float32
+                        )
+                        nbytes += maxima.numel() * maxima.element_size()
+                    self.assertLessEqual(nbytes + reserve, budget)
+        self.assertEqual(_score_rows_per_chunk(1048580, block_size=8), 26)
+
     def test_verify_rows_chunking_mixed_ratios_and_underfill(self):
         req = torch.tensor([2, 2, 0, 0, 0, 1])
         positions = torch.tensor([258, 259, -1, 0, 7, 16])

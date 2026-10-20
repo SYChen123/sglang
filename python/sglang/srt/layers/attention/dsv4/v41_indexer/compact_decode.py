@@ -10,6 +10,7 @@ from __future__ import annotations
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.deep_select import get_input_stride_alignment_bytes
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_paged
 from sglang.kernels.ops.attention.dsv4.sm90_candidate import (
     candidate_block_state,
@@ -23,7 +24,21 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 
 from .types import CandidateMetadata, DecodeInputs
 
-_SCORE_BUDGET_BYTES = 64 << 20
+_SCORE_BUDGET_BYTES = 128 << 20
+
+
+def _score_rows_per_chunk(width: int, *, block_size: int | None) -> int:
+    # Account for the allocations made by fp4_index_logits_paged: FP32 logits
+    # aligned for DeepSelect, plus aligned FP32 block maxima for the source.
+    alignment = get_input_stride_alignment_bytes()
+    row_bytes = (width * 4 + alignment - 1) // alignment * alignment
+    if block_size is not None:
+        blocks = (width + block_size - 1) // block_size
+        row_bytes += (blocks * 4 + 15) // 16 * 16
+    # Leave room for selection indices, sorting and TopK plans. The old 8 bytes
+    # per score substantially overestimated these per-chunk allocations.
+    reserve = min(8 << 20, _SCORE_BUDGET_BYTES // 16)
+    return max(1, (_SCORE_BUDGET_BYTES - reserve) // max(1, row_bytes))
 
 
 class CompactDecodeBlocks(CandidateMetadata, msgspec.Struct):
@@ -84,7 +99,9 @@ def compact_decode(
                 blocks, published.counts, lens, block_size=block_size
             )
     width = lmax if blocks is None else blocks.shape[1] * block_size
-    rows_per_chunk = max(1, _SCORE_BUDGET_BYTES // (width * 8))
+    rows_per_chunk = _score_rows_per_chunk(
+        width, block_size=block_size if published is None else None
+    )
     source_blocks = source_counts = None
     if published is None:
         source_blocks = torch.empty(
