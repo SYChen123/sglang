@@ -462,3 +462,29 @@ register_kernel(
         ),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="attention.reduce_head_scores",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsv4.index_score_reduce:reduce_head_scores",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="BF16 indexer head-score epilogue with Torch rounding.",
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.candidate_scores",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsv4.candidate_scores:candidate_scores",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="Per-query candidate-block BF16 indexer scores.",
+        ),
+    )
+)

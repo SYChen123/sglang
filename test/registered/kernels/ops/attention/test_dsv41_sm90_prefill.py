@@ -194,6 +194,145 @@ class TestSM90Prefill(CustomTestCase):
                     visible = min(8, (int(positions[row]) + 1) // ratio)
                     self.assertEqual(set(raw[row].tolist()) - {-1}, set(range(visible)))
 
+    def test_bf16_compact_scores_per_query_masks_topk_and_graph_replay(self):
+        """Torch fallback scores only each row's candidates, including TP4 heads."""
+        from sglang.kernels.ops.attention.dsv4.candidate_scores import (
+            candidate_scores,
+            candidate_topk,
+        )
+
+        for heads in (8, 32, 64):
+            with self.subTest(heads=heads):
+                q = torch.randn(5, heads, 128, device="cuda").bfloat16()
+                keys = torch.randn(259, 128, device="cuda").bfloat16()
+                weights = torch.randn(5, heads, device="cuda").bfloat16()
+                lens = torch.tensor(
+                    [0, 1, 63, 258, 259], device="cuda", dtype=torch.int32
+                )
+                blocks = torch.tensor(
+                    [[0, -1, 1], [0, 2, -1], [7, -1, 0], [32, 1, 9], [3, 32, 100]],
+                    device="cuda",
+                    dtype=torch.int32,
+                )
+                for _ in range(2):
+                    candidate_scores(q, keys, weights, blocks, lens)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = candidate_scores(q, keys, weights, blocks, lens)
+                    picked = candidate_topk(actual, blocks, 32)
+                for replay in range(2):
+                    if replay:
+                        blocks.copy_(blocks.flip(0))
+                        lens.copy_(torch.tensor([259, 63, 0, 1, 258], device="cuda"))
+                    graph.replay()
+                    logical = (
+                        blocks[:, :, None].long() * 8 + torch.arange(8, device="cuda")
+                    ).flatten(1)
+                    valid = (blocks >= 0).repeat_interleave(8, 1)
+                    valid &= (logical < lens[:, None]) & (logical < keys.shape[0])
+                    # The Triton dot accumulates in FP32. Small cuBLAS BF16
+                    # GEMMs may reduce in BF16; use an independent FP32 dot
+                    # and retain both BF16 rounding boundaries of the epilogue.
+                    dots = torch.einsum(
+                        "bhd,nd->bhn", q.float(), keys.float()
+                    ).bfloat16()
+                    dense = (dots.relu() * weights[:, :, None]).sum(1).float()
+                    expected = dense.gather(1, logical.clamp(0, 258)).masked_fill(
+                        ~valid, -torch.inf
+                    )
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    for row in range(5):
+                        self.assertEqual(
+                            set(picked[row].tolist()) - {-1},
+                            set(logical[row][valid[row]].tolist()),
+                        )
+
+    def test_bf16_head_epilogue_matches_torch_rounding_and_strides(self):
+        """Fusion retains BF16 product rounding and the 32-head reduction order."""
+        from sglang.kernels.ops.attention.dsv4.index_score_reduce import (
+            reduce_head_scores,
+        )
+
+        for heads, width in ((32, 259), (32, 1088), (32, 1), (8, 129)):
+            with self.subTest(heads=heads, width=width):
+                backing = torch.randn(3, heads, width + 7, device="cuda").bfloat16()
+                scores = backing[:, :, :width]
+                weights = torch.randn(3, heads * 2, device="cuda").bfloat16()[:, ::2]
+                expected = (scores.relu() * weights.unsqueeze(-1)).sum(1).float()
+                actual = reduce_head_scores(scores, weights)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_torch_aligned_width_keeps_cp_causality_and_pool_mapping(self):
+        """Padding a 1025-column GEMM must not publish its extra K columns."""
+        from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+
+        for heads in (8, 32):
+            with self.subTest(heads=heads):
+                _, values = packed_keys(4096)
+                # Give each request 2048 logical slots, with nonidentity pool mapping.
+                req_table = torch.randperm(4096, device="cuda").view(2, 2048)
+                pool = SimpleNamespace(
+                    get_low_ratio_index_k_dequant=lambda _, slots: values[slots]
+                )
+                positions = torch.tensor([16, 1024, 0], device="cuda")
+                q = values[torch.randint(0, 100, (3, heads), device="cuda")]
+                weights = torch.randn(3, heads, device="cuda").bfloat16()
+                raw = torch.full((3, 16), 999, dtype=torch.int32, device="cuda")
+                inputs = PrefillInputs(
+                    indexer=SimpleNamespace(
+                        index_topk=16,
+                        index_head_dim=128,
+                        n_local_heads=heads,
+                        queries=lambda q, freqs: q,
+                        head_weights=lambda x: x,
+                        scores=rounded_scores,
+                    ),
+                    layer_id=0,
+                    compress_ratio=1,
+                    freqs_cis=torch.ones(2048, 1, device="cuda"),
+                    x=weights,
+                    q_lora=q,
+                    positions=positions,
+                    req_rows=None,
+                    req_pool_indices=torch.tensor([1, 0], device="cuda"),
+                    kv_page_table=torch.empty(0, device="cuda"),
+                    seq_lens_cpu=[1025, 1],
+                    rows_per_request=[2, 1],
+                    rows_per_request_device=torch.tensor([2, 1], device="cuda"),
+                    out_raw_indices=raw,
+                    out_page_indices=raw.clone(),
+                )
+                backend = FullTopKIndexer(
+                    token_to_kv_pool=pool,
+                    req_to_token=req_table,
+                    use_deep_gemm_prefill=False,
+                    use_deep_gemm_decode=False,
+                )
+                with (
+                    envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(True),
+                    patch.object(
+                        scoring, "_TORCH_SCORE_BUDGET_BYTES", heads * 1088 * 2
+                    ),
+                ):
+                    backend.topk_prefill(inputs)
+                for row, req in enumerate((1, 1, 0)):
+                    visible = int(positions[row]) + 1
+                    picked = raw[row][raw[row] >= 0].long()
+                    self.assertEqual(picked.numel(), min(16, visible))
+                    self.assertTrue((picked < visible).all())
+                    keys = values[req_table[req, :visible]]
+                    reference = rounded_scores(
+                        q[row : row + 1], keys, weights[row : row + 1]
+                    )[0]
+                    threshold = reference.topk(min(16, visible)).values[-1]
+                    self.assertTrue((reference[picked] >= threshold).all())
+                    self.assertTrue(
+                        torch.equal(
+                            inputs.out_page_indices[row, : picked.numel()].long(),
+                            req_table[req, picked],
+                        )
+                    )
+
     def test_compact_scores_per_query_holes_partial_blocks_and_graph_replay(self):
         """Candidate columns retain dense scores as row mappings and lengths change."""
         for heads in (32, 64):
@@ -247,7 +386,10 @@ class TestSM90Prefill(CustomTestCase):
         """A bounded CP tail uses its published rows, never padded encoder rows."""
         table, values = packed_keys(4 * 512)
         req_table = torch.randperm(4 * 512, device="cuda").view(4, 512)
-        pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda _: table)
+        pool = SimpleNamespace(
+            get_index_k_with_scale_buffer=lambda _: table,
+            get_low_ratio_index_k_dequant=lambda _, slots: values[slots],
+        )
         raw = torch.full((5, 16), 999, dtype=torch.int32, device="cuda")
         positions = torch.tensor([80, 90, 258, 0, 0], device="cuda")
         inputs = PrefillInputs(
@@ -257,6 +399,7 @@ class TestSM90Prefill(CustomTestCase):
                 n_local_heads=32,
                 queries=lambda q, freqs: q,
                 head_weights=lambda x: x,
+                scores=rounded_scores,
             ),
             layer_id=0,
             compress_ratio=1,
@@ -289,10 +432,12 @@ class TestSM90Prefill(CustomTestCase):
             candidate_block_size=8,
             use_deep_gemm_prefill=False,
         )
-        for mode in ("triton", "auto"):
+        for mode in ("triton", "auto", "torch"):
             with (
-                envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(False),
-                envs.SGLANG_DSV41_SM90_PREFILL_INDEXER.override(mode),
+                envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(mode == "torch"),
+                envs.SGLANG_DSV41_SM90_PREFILL_INDEXER.override(
+                    "auto" if mode == "torch" else mode
+                ),
                 envs.SGLANG_DSV41_SM90_PREFILL_INDEXER_DEEPGEMM_MIN_ROWS.override(128),
             ):
                 backend.consume_prefill(inputs, published)

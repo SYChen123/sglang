@@ -320,6 +320,16 @@ def prefill_requests(
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
+    # A bounded CP tail can retain the encoder's BCG padding. Only its real
+    # request rows own queries or published candidates; reset all output rows.
+    inputs.reset_outputs()
+    if inputs.rows_per_request is not None:
+        real_rows = sum(inputs.rows_per_request)
+        pos = pos[:real_rows]
+        if req is not None:
+            req = req[:real_rows]
+    if pos.numel() == 0:
+        return
     if req is None:
         # CP already provides this rank's row count for each request, including
         # empty shards. Reconstruct ownership without using full-prefill lengths.
@@ -329,9 +339,8 @@ def prefill_requests(
             inputs.rows_per_request_device.to(torch.int64),
             output_size=pos.shape[0],
         )
-    inputs.reset_outputs()
-    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
-    weights = indexer.head_weights(inputs.x)
+    q = indexer.queries(inputs.q_lora[: pos.numel()], inputs.freqs_cis[pos])
+    weights = indexer.head_weights(inputs.x[: pos.numel()])
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
@@ -345,13 +354,25 @@ def prefill_requests(
         slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
         # Dequantize only this request's visible K rows; the table is pool-sized.
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
+        # Keep BF16 GEMM output rows aligned for Hopper tensor-core kernels.
+        # Pad K once per request; padded positions never enter selection.
+        if index_k.is_cuda and index_k.dtype == torch.bfloat16 and lc >= 1024:
+            score_width = (lc + 63) // 64 * 64
+            if score_width != lc:
+                index_k = torch.nn.functional.pad(index_k, (0, 0, 0, score_width - lc))
         request = RequestScores(
             lc=lc, k=min(topk, lc), columns=j, tok=tok, lens=lens, slots=slots
         )
         yield (
             request,
             _score_chunks(
-                indexer=indexer, q=q, weights=weights, index_k=index_k, request=request
+                indexer=indexer,
+                q=q,
+                weights=weights,
+                index_k=index_k,
+                request=request,
+                candidate_blocks=candidate_blocks,
+                candidate_block_size=candidate_block_size,
             ),
         )
 
@@ -363,16 +384,53 @@ def _score_chunks(
     weights: torch.Tensor,
     index_k: torch.Tensor,
     request: RequestScores,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    candidate_block_size: int = 8,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
-    # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    candidate_width = (
+        candidate_blocks.shape[1] * candidate_block_size
+        if candidate_blocks is not None
+        else 0
+    )
+    candidate_only = (
+        candidate_width > 0
+        and candidate_width * 2 <= lc
+        and q.is_cuda
+        and torch.version.hip is None
+        and q.dtype == index_k.dtype == weights.dtype == torch.bfloat16
+        and q.shape[1] <= 64
+        and q.shape[2] == 128
+    )
+    score_width = candidate_width if candidate_only else index_k.shape[0]
+    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * score_width * 2))
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-        s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
-        yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
+        blocks_c = candidate_blocks[tok_c] if candidate_only else None
+        if candidate_only:
+            from sglang.kernels.ops.attention.dsv4.candidate_scores import (
+                candidate_scores,
+            )
+
+            s = candidate_scores(
+                q[tok_c],
+                index_k,
+                weights[tok_c],
+                blocks_c,
+                lens_c,
+                candidate_block_size,
+            )
+        else:
+            s = indexer.scores(q[tok_c], index_k, weights[tok_c])[:, :lc]
+            s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+        yield ChunkScores(
+            rows=rows,
+            tok=tok_c,
+            lens=lens_c,
+            scores=s,
+            candidate_blocks=blocks_c,
+        )
 
 
 def write_prefill(

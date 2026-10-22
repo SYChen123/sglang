@@ -261,6 +261,19 @@ class DenseBlocksBackend:
         ):
             for chunk in chunks:
                 if chunk.candidate_blocks is not None:
+                    if not chunk.use_ragged_topk:
+                        from sglang.kernels.ops.attention.dsv4.candidate_scores import (
+                            candidate_topk,
+                        )
+
+                        idx = candidate_topk(
+                            chunk.scores,
+                            chunk.candidate_blocks,
+                            request.k,
+                            self.block_size,
+                        )
+                        write_prefill(inputs, request, chunk, idx)
+                        continue
                     # Compact columns can contain holes: use the complete
                     # compact width for Top-K, then reject -inf selections.
                     width = chunk.scores.shape[1]
