@@ -139,6 +139,26 @@ class TransferInfo:
 _RequestBatchTransfer = Tuple[TransferKVChunk, TransferInfo, List[Tuple[int, int, int]]]
 
 
+def _coalesce_transfer_blocks(
+    blocks: List[Tuple[int, int, int]],
+) -> List[Tuple[int, int, int]]:
+    """Merge byte-adjacent blocks when both source and destination continue.
+
+    Descriptors planned for different requests in a batch can abut when their
+    pages are contiguous. One concatenated copy writes exactly the same
+    destination bytes with fewer transfer entries.
+    """
+    coalesced: List[Tuple[int, int, int]] = []
+    for src, dst, length in blocks:
+        if coalesced:
+            prev_src, prev_dst, prev_len = coalesced[-1]
+            if prev_src + prev_len == src and prev_dst + prev_len == dst:
+                coalesced[-1] = (prev_src, prev_dst, prev_len + length)
+                continue
+        coalesced.append((src, dst, length))
+    return coalesced
+
+
 # decode
 @dataclasses.dataclass
 class KVArgsRegisterInfo:
@@ -2441,6 +2461,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 groups[transfer[1].mooncake_session_id].append(transfer)
 
         results = {}
+        # session -> transport code of a sub-batch that already failed during
+        # this drain. A failed/timeout batch does not prove every write drained,
+        # so the session must not be used again for the remaining members.
+        failed_batch: Dict[str, int] = {}
+
+        def fail_unsubmitted(session, members, ret):
+            for chunk, _, _ in members:
+                results[(id(chunk), session)] = ret
+                self.poison_deferred_ack_room(chunk.room)
 
         def submit(session, members):
             # An abort may have arrived while addresses were being planned.
@@ -2450,9 +2479,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if self.request_status.get(member[0].room, KVPoll.Failed)
                 != KVPoll.Failed
             ]
+            if not members:
+                return
+            if session in failed_batch:
+                # Do not submit to a session that already failed this drain;
+                # fail the remaining members with the recorded transport code so
+                # the per-chunk path fails their rooms without extra I/O.
+                fail_unsubmitted(session, members, failed_batch[session])
+                return
             if len(members) < 2:
                 return
-            blocks = [block for _, _, plan in members for block in plan]
+            plans = [plan for _, _, plan in members]
+            if len({len(plan) for plan in plans}) == 1:
+                # Same descriptor shape: walk descriptor index outermost so
+                # byte-adjacent runs from different requests can be coalesced.
+                blocks = _coalesce_transfer_blocks(
+                    [plan[i] for i in range(len(plans[0])) for plan in plans]
+                )
+            else:
+                blocks = _coalesce_transfer_blocks(
+                    [block for plan in plans for block in plan]
+                )
             ret = self._transfer_data(session, blocks)
             for chunk, _, _ in members:
                 results[(id(chunk), session)] = ret
@@ -2460,6 +2507,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # A failed/timeout batch does not prove every write drained.
                     # Keep decode's deferred-release ACK conservative.
                     self.poison_deferred_ack_room(chunk.room)
+            if ret != 0:
+                failed_batch[session] = ret
 
         for session, transfers in groups.items():
             members = []

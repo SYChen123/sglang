@@ -959,5 +959,45 @@ class TestMooncakeRequestBatching(CustomTestCase):
         self.assertTrue(manager._request_batching_enabled())
 
 
+    def test_failed_batch_session_is_not_submitted_again(self):
+        manager = self._manager()
+        manager.max_request_batch_bytes = 16
+        chunks = [self._chunk(manager, i, [i], [i + 10]) for i in range(1, 5)]
+        self.failed_submission = 1
+        self._run(manager, chunks)
+        # The second bounded sub-batch of the same session must not be sent.
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(set(manager.request_status.values()), {KVPoll.Failed})
+        self.assertEqual(manager._deferred_ack_poisoned_rooms, {1, 2, 3, 4})
+        self.assertEqual(manager.failed_sessions, {"peer"})
+        self.assertTrue(all(np.all(buf == -1) for buf in self.destinations["peer"]))
+
+    def test_adjacent_ranges_across_requests_are_coalesced(self):
+        manager = self._manager()
+        chunks = [
+            self._chunk(manager, 1, [1, 2], [11, 12]),
+            self._chunk(manager, 2, [3, 4], [13, 14]),
+        ]
+        self._run(manager, chunks)
+        # 2 requests x 2 layers -> 4 descriptors, coalesced into 2.
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls[0][3]), 2)
+        self.assertEqual(sum(self.calls[0][3]), 4 * 4 * 2)  # 4 pages x 4B x 2 layers
+        self._assert_pages("peer", [1, 2, 3, 4], [11, 12, 13, 14])
+        self.assertEqual(set(manager.request_status.values()), {KVPoll.WaitingForInput})
+
+    def test_fragmented_ranges_disable_coalescing(self):
+        manager = self._manager()
+        chunks = [
+            self._chunk(manager, 1, [1, 3], [11, 14]),
+            self._chunk(manager, 2, [5, 7], [16, 19]),
+        ]
+        self._run(manager, chunks)
+        # Fragment boundaries keep all descriptors separate.
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls[0][3]), 8)
+        self._assert_pages("peer", [1, 3, 5, 7], [11, 14, 16, 19])
+
+
 if __name__ == "__main__":
     unittest.main()
