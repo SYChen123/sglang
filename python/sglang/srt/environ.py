@@ -1641,6 +1641,9 @@ class Envs:
     # In auto mode, select DG by the actual rank-local query rows in a score
     # chunk, after applying the score-buffer budget (not request/context size).
     SGLANG_DSV41_SM90_PREFILL_INDEXER_DEEPGEMM_MIN_ROWS = EnvInt(128)
+    # Hopper decode/verify: fuse FP4 K unpacking with an FP8 dot, retaining
+    # BF16 post-dot rounds and a BF16 fallback for out-of-range inputs.
+    SGLANG_OPT_DSV41_DECODE_INDEXER_FP8 = EnvBool(False)
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)

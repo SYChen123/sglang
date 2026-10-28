@@ -8,6 +8,9 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    _fp4_index_logits_paged_kernel,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_decode as dense_logits,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
@@ -22,6 +25,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -48,7 +52,15 @@ def fp4_index_logits_decode(
 ):
     # Adapt the theta test fixture to this branch's separate dense/paged APIs.
     if req_indices is None:
-        return dense_logits(q, weights, mapping, lens, table, page_size)
+        return dense_logits(
+            q,
+            weights,
+            mapping,
+            lens,
+            table,
+            page_size,
+            use_fp8=envs.SGLANG_OPT_DSV41_DECODE_INDEXER_FP8.get(),
+        )
     return fp4_index_logits_paged(
         q,
         weights,
@@ -62,6 +74,7 @@ def fp4_index_logits_decode(
         candidate_blocks=candidate_blocks,
         candidate_block_size=candidate_block_size,
         return_block_scores=return_block_scores,
+        use_fp8=envs.SGLANG_OPT_DSV41_DECODE_INDEXER_FP8.get(),
     )
 
 
@@ -72,6 +85,83 @@ def fp4_index_logits_decode(
     "requires SM90+ CUDA",
 )
 class TestSM90CandidateKernels(CustomTestCase):
+    def test_fp8_logits_and_bf16_repair(self):
+        torch.manual_seed(42)
+        rows, width, page_size = 6, 193, 64
+        slots = (torch.arange(rows * width, device="cuda") * 31 % 2048).reshape(
+            rows, width
+        )
+        req = torch.arange(rows, device="cuda", dtype=torch.int32)
+        lens = torch.tensor([193, 0, 1, 63, 64, 65], device="cuda", dtype=torch.int32)
+        levels = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda", dtype=torch.bfloat16
+        )
+        table = torch.randint(
+            0, 256, (32, page_size * 68), device="cuda", dtype=torch.uint8
+        )
+        for heads in (32, 64):
+            q = levels[torch.randint(0, 8, (rows, heads, 128), device="cuda")]
+            q *= torch.randint(0, 2, q.shape, device="cuda") * 2 - 1
+            weights = torch.randn(rows, heads, device="cuda", dtype=torch.bfloat16)
+            query = q.clone()
+            table[:, page_size * 64 :] = 127
+            args = (query, weights, req, slots.int(), lens, table, page_size, width, 1)
+            compiled = []
+            original_run = _fp4_index_logits_paged_kernel.run
+
+            def record_kernel(*args, **kwargs):
+                kernel = original_run(*args, **kwargs)
+                compiled.append(kernel)
+                return kernel
+
+            with patch.object(
+                _fp4_index_logits_paged_kernel, "run", side_effect=record_kernel
+            ):
+                fp4_index_logits_paged(*args, use_fp8=True)
+            if torch.cuda.get_device_capability()[0] == 9:
+                # FP8 tensor dtype alone is insufficient: Triton can silently
+                # upcast a 32-head dot or max_num_imprecise_acc=0 to FP16 MMA.
+                self.assertTrue(
+                    any(
+                        "mma" in line and ".e4m3.e4m3" in line
+                        for line in compiled[0].asm["ptx"].splitlines()
+                    )
+                )
+            for _ in range(3):
+                fp4_index_logits_paged(*args, use_fp8=True)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = fp4_index_logits_paged(*args, use_fp8=True)
+            # Reuse one graph while entering and leaving the repair path,
+            # including the exact E4M3 exponent-guard boundaries.
+            for q_exp, k_exp in (
+                (0, 0),
+                (-12, 0),
+                (-7, 0),
+                (-8, 0),
+                (0, 12),
+                (12, -12),
+                (0, -5),
+                (0, 6),
+                (0, -6),
+                (0, 7),
+                (0, 0),
+            ):
+                with self.subTest(heads=heads, q_exp=q_exp, k_exp=k_exp):
+                    query.copy_(q * (2.0**q_exp))
+                    table[:, page_size * 64 :] = 127 + k_exp
+                    expected = dense_logits(
+                        query, weights, slots, lens, table, page_size
+                    )
+                    actual.fill_(torch.nan)
+                    graph.replay()
+                    visible = (
+                        torch.arange(width, device="cuda")[None, :] < lens[:, None]
+                    )
+                    torch.testing.assert_close(
+                        actual[visible], expected[visible], rtol=0, atol=0
+                    )
+
     def test_runtime_backend_graph_replays_mixed_ratio_and_row_chunks(self):
         from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
             DenseBlocksBackend,

@@ -21,6 +21,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
@@ -530,6 +531,7 @@ def decode_scores(
             lmax,
             ratio,
             candidate_mask,
+            use_fp8=envs.SGLANG_OPT_DSV41_DECODE_INDEXER_FP8.get(),
         )
         return PagedDecodeScores(
             bs=bs,

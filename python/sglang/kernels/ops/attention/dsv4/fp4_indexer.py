@@ -658,6 +658,24 @@ def _e2m1_decode(code):
 
 
 @triton.jit
+def _prepare_fp8_index_query(
+    q_ptr, b, stride_qb, stride_qh, H: tl.constexpr, D: tl.constexpr
+):
+    # Hopper WGMMA needs M >= 64. Keeping M=32 makes Triton select an
+    # FP16 MMA even when the source tensors have FP8 dtype.
+    offs_h = tl.arange(0, max(H, 64))
+    offs_d = tl.arange(0, D)
+    q = tl.load(
+        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :],
+        mask=offs_h[:, None] < H,
+        other=0,
+    )
+    q_fp8 = q.to(tl.float8e4nv)
+    exact = tl.sum(tl.sum((q_fp8.to(q.dtype) != q).to(tl.int32), 0), 0) == 0
+    return q_fp8, exact
+
+
+@triton.jit
 def _fp4_index_logits_tile(
     q_ptr,
     w_ptr,
@@ -672,8 +690,11 @@ def _fp4_index_logits_tile(
     stride_wb,
     H: tl.constexpr,
     HALF_D: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    q_fp8,
+    exact_q,
 ):
-    offs_h = tl.arange(0, H)
+    offs_h = tl.arange(0, max(H, 64) if USE_FP8 else H)
     offs_i = tl.arange(0, HALF_D)
     page = slot // page_size
     off = slot % page_size
@@ -687,8 +708,6 @@ def _fp4_index_logits_tile(
         mask=valid[:, None],
         other=0,
     )
-    low = _e2m1_decode(pay & 0x0F)
-    high = _e2m1_decode((pay >> 4) & 0x0F)
     # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
     sc_idx = offs_i // 16
     exps = tl.load(
@@ -700,28 +719,54 @@ def _fp4_index_logits_tile(
         mask=valid[:, None],
         other=127,
     )
-    scale = tl.exp2(exps.to(tl.float32) - 127.0)
-    k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
-    k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
-
-    # queries: even / odd elements, [H, HALF_D] bf16
-    q_even = tl.load(
-        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
-    )
-    q_odd = tl.load(
-        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :] + 1
-    )
-
-    acc = tl.dot(q_even, tl.trans(k_low))  # [H, BLOCK_L] fp32
-    acc += tl.dot(q_odd, tl.trans(k_high))
+    if USE_FP8:
+        # Expand nibble pairs while they are still bytes. Applying an E8M0
+        # scale to a normal E4M3 value is an integer exponent adjustment; this
+        # avoids FP32 dequantization, BF16 temporaries and their layout changes.
+        code = tl.interleave(pay & 0x0F, pay >> 4)
+        e = (code >> 1) & 3
+        m = code & 1
+        bits = tl.where(e == 0, 0x30, ((e + 6) << 3) | (m << 2)).to(tl.int32)
+        bits += (tl.interleave(exps, exps).to(tl.int32) - 127) * 8
+        bits = tl.where((code & 7) == 0, 0, bits) | ((code & 8).to(tl.int32) << 4)
+        k_fp8 = bits.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
+        # These scales keep every nonzero E2M1 level normal and finite in
+        # E4M3. Subnormal scales go through the BF16 repair pass as well.
+        exact_k = tl.min(tl.min(exps, 0), 0) >= 122
+        exact_k = exact_k & (tl.max(tl.max(exps, 0), 0) <= 133)
+        needs_repair = ~(exact_q & exact_k)
+        # Promote after each K=32 group (the FP4 scale-group width). Setting
+        # this to zero makes Triton emulate the FP8 dot with FP16 operands.
+        acc = tl.dot(
+            q_fp8, tl.trans(k_fp8), out_dtype=tl.float32, max_num_imprecise_acc=32
+        )
+    else:
+        low = _e2m1_decode(pay & 0x0F)
+        high = _e2m1_decode((pay >> 4) & 0x0F)
+        scale = tl.exp2(exps.to(tl.float32) - 127.0)
+        k_low = (low * scale).to(tl.bfloat16)
+        k_high = (high * scale).to(tl.bfloat16)
+        q_even = tl.load(
+            q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
+        )
+        q_odd = tl.load(
+            q_ptr
+            + b * stride_qb
+            + offs_h[:, None] * stride_qh
+            + 2 * offs_i[None, :]
+            + 1
+        )
+        needs_repair = False
+        acc = tl.dot(q_even, tl.trans(k_low))
+        acc += tl.dot(q_odd, tl.trans(k_high))
     # reference rounding points: bf16 dot -> relu -> * bf16 weight -> bf16 -> sum -> bf16
     s = acc.to(tl.bfloat16).to(tl.float32)
     s = tl.maximum(s, 0.0)
-    w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
+    w = tl.load(w_ptr + b * stride_wb + offs_h, mask=offs_h < H, other=0).to(tl.float32)
     s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
     logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
     logit = tl.where(valid, logit, float("-inf"))
-    return logit
+    return logit, needs_repair
 
 
 @triton.jit
@@ -732,6 +777,7 @@ def _fp4_index_logits_kernel(
     lens_ptr,  # [B] int64 visible compressed positions per request
     table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
     out_ptr,  # [B, L] fp32 logits, -inf beyond lens
+    repair_ptr,  # [B, ceil(L / BLOCK_L)] flags, consumed before top-k
     L,
     page_size,
     row_stride,
@@ -741,6 +787,8 @@ def _fp4_index_logits_kernel(
     H: tl.constexpr,
     HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
     BLOCK_L: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    REPAIR_FP8: tl.constexpr,
 ):
     # The caller returns for L == 0 and makes q contiguous. Exclude singleton
     # heads, whose stride is not constrained by PyTorch contiguity.
@@ -751,17 +799,23 @@ def _fp4_index_logits_kernel(
     lb = tl.program_id(1)
     offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
     n_vis = tl.load(lens_ptr + b)
+    if USE_FP8:
+        q_fp8, exact_q = _prepare_fp8_index_query(
+            q_ptr, b, stride_qb, stride_qh, H, HALF_D * 2
+        )
+    else:
+        q_fp8, exact_q = None, True
     # Graph replay keeps the capacity-sized grid even for short live contexts.
     # Skip whole invisible tiles using the current device-side length; masking
     # only the K loads would still run dequantization, dot products and reduction.
     if lb * BLOCK_L >= n_vis:
         tl.store(out_ptr + b * L + offs_l, float("-inf"), mask=offs_l < L)
-    else:
+    elif not REPAIR_FP8 or tl.load(repair_ptr + b * tl.cdiv(L, BLOCK_L) + lb) != 0:
         valid = offs_l < tl.minimum(n_vis, L)
         slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(
             tl.int64
         )
-        logit = _fp4_index_logits_tile(
+        logit, needs_repair = _fp4_index_logits_tile(
             q_ptr,
             w_ptr,
             table_ptr,
@@ -775,7 +829,12 @@ def _fp4_index_logits_kernel(
             stride_wb,
             H,
             HALF_D,
+            USE_FP8,
+            q_fp8,
+            exact_q,
         )
+        if USE_FP8:
+            tl.store(repair_ptr + b * tl.cdiv(L, BLOCK_L) + lb, needs_repair)
         tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
 
 
@@ -786,6 +845,8 @@ def fp4_index_logits_decode(
     lens: torch.Tensor,
     table: torch.Tensor,
     page_size: int,
+    *,
+    use_fp8: bool = False,
 ) -> torch.Tensor:
     """Decode index logits from the fp4 index-K pool. q [B, H, 128] bf16, weights
     [B, H], slots [B, L] int64, lens [B] int64, table = the layer's index-K page
@@ -802,25 +863,35 @@ def fp4_index_logits_decode(
     if L == 0:
         return out
     BLOCK_L = 64
-    grid = (B, triton.cdiv(L, BLOCK_L))
-    _fp4_index_logits_kernel[grid](
-        q,
-        weights,
-        slots,
-        lens.to(torch.int64).contiguous(),
-        table,
-        out,
-        L,
-        page_size,
-        table.stride(0),
-        q.stride(0),
-        q.stride(1),
-        weights.stride(0),
-        H=H,
-        HALF_D=INDEX_HEAD_DIM // 2,
-        BLOCK_L=BLOCK_L,
-        num_warps=4,
+    repair = (
+        torch.empty((B, triton.cdiv(L, BLOCK_L)), dtype=torch.uint8, device=q.device)
+        if use_fp8
+        else None
     )
+    grid = (B, triton.cdiv(L, BLOCK_L))
+    lengths = lens.to(torch.int64).contiguous()
+    for repair_pass in range(2 if use_fp8 else 1):
+        _fp4_index_logits_kernel[grid](
+            q,
+            weights,
+            slots,
+            lengths,
+            table,
+            out,
+            repair,
+            L,
+            page_size,
+            table.stride(0),
+            q.stride(0),
+            q.stride(1),
+            weights.stride(0),
+            H=H,
+            HALF_D=INDEX_HEAD_DIM // 2,
+            BLOCK_L=BLOCK_L,
+            USE_FP8=use_fp8 and not repair_pass,
+            REPAIR_FP8=bool(repair_pass),
+            num_warps=4,
+        )
     return out
 
 
@@ -836,6 +907,7 @@ def _fp4_index_logits_paged_kernel(
     out_ptr,
     blocks_ptr,
     block_scores_ptr,
+    repair_ptr,
     L,
     page_size,
     row_stride,
@@ -855,66 +927,85 @@ def _fp4_index_logits_paged_kernel(
     CANDIDATE_BLOCK_SIZE: tl.constexpr,
     WRITE_BLOCK_SCORES: tl.constexpr,
     BLOCK_L: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    REPAIR_FP8: tl.constexpr,
 ):
     b = tl.program_id(0)
     n_vis = tl.minimum(tl.load(lens_ptr + b), L)
     req = tl.load(req_ptr + b).to(tl.int64)
+    if USE_FP8:
+        q_fp8, exact_q = _prepare_fp8_index_query(
+            q_ptr, b, stride_qb, stride_qh, H, HALF_D * 2
+        )
+    else:
+        q_fp8, exact_q = None, True
     for tile in range(tl.program_id(1), tl.cdiv(n_vis, BLOCK_L), tl.num_programs(1)):
-        offs_l = tile * BLOCK_L + tl.arange(0, BLOCK_L)
-        valid = offs_l < n_vis
-        if HAS_MASK:
-            valid = valid & tl.load(
-                mask_ptr + b * mask_stride + offs_l, mask=offs_l < n_vis, other=False
+        do_tile = True
+        if REPAIR_FP8:
+            do_tile = tl.load(repair_ptr + b * tl.cdiv(L, BLOCK_L) + tile) != 0
+        if do_tile:
+            offs_l = tile * BLOCK_L + tl.arange(0, BLOCK_L)
+            valid = offs_l < n_vis
+            if HAS_MASK:
+                valid = valid & tl.load(
+                    mask_ptr + b * mask_stride + offs_l,
+                    mask=offs_l < n_vis,
+                    other=False,
+                )
+            logical = offs_l
+            if USE_CANDIDATES:
+                block = tl.load(
+                    blocks_ptr + b * blocks_stride + offs_l // CANDIDATE_BLOCK_SIZE,
+                    mask=valid,
+                    other=0,
+                )
+                logical = block * CANDIDATE_BLOCK_SIZE + offs_l % CANDIDATE_BLOCK_SIZE
+            slot = (
+                tl.load(
+                    req_table_ptr + req * req_stride + logical * RATIO,
+                    mask=valid,
+                    other=0,
+                ).to(tl.int64)
+                // RATIO
             )
-        logical = offs_l
-        if USE_CANDIDATES:
-            block = tl.load(
-                blocks_ptr + b * blocks_stride + offs_l // CANDIDATE_BLOCK_SIZE,
-                mask=valid,
-                other=0,
+            logit, needs_repair = _fp4_index_logits_tile(
+                q_ptr,
+                w_ptr,
+                table_ptr,
+                b,
+                slot,
+                valid,
+                page_size,
+                row_stride,
+                stride_qb,
+                stride_qh,
+                stride_wb,
+                H,
+                HALF_D,
+                USE_FP8,
+                q_fp8,
+                exact_q,
             )
-            logical = block * CANDIDATE_BLOCK_SIZE + offs_l % CANDIDATE_BLOCK_SIZE
-        slot = (
-            tl.load(
-                req_table_ptr + req * req_stride + logical * RATIO,
-                mask=valid,
-                other=0,
-            ).to(tl.int64)
-            // RATIO
-        )
-        logit = _fp4_index_logits_tile(
-            q_ptr,
-            w_ptr,
-            table_ptr,
-            b,
-            slot,
-            valid,
-            page_size,
-            row_stride,
-            stride_qb,
-            stride_qh,
-            stride_wb,
-            H,
-            HALF_D,
-        )
-        tl.store(out_ptr + b * out_stride + offs_l, logit, mask=offs_l < L)
-        if WRITE_BLOCK_SCORES:
-            blocks_per_tile: tl.constexpr = BLOCK_L // CANDIDATE_BLOCK_SIZE
-            scores = tl.max(
-                tl.reshape(logit, (blocks_per_tile, CANDIDATE_BLOCK_SIZE)), 1
-            )
-            blocks = tile * blocks_per_tile + tl.arange(0, blocks_per_tile)
-            # Always retain the newest visible block, including a partial pair.
-            scores = tl.where(
-                (n_vis > 0) & (blocks == (n_vis - 1) // CANDIDATE_BLOCK_SIZE),
-                float("inf"),
-                scores,
-            )
-            tl.store(
-                block_scores_ptr + b * block_scores_stride + blocks,
-                scores,
-                blocks < tl.cdiv(L, CANDIDATE_BLOCK_SIZE),
-            )
+            if USE_FP8:
+                tl.store(repair_ptr + b * tl.cdiv(L, BLOCK_L) + tile, needs_repair)
+            tl.store(out_ptr + b * out_stride + offs_l, logit, mask=offs_l < L)
+            if WRITE_BLOCK_SCORES:
+                blocks_per_tile: tl.constexpr = BLOCK_L // CANDIDATE_BLOCK_SIZE
+                scores = tl.max(
+                    tl.reshape(logit, (blocks_per_tile, CANDIDATE_BLOCK_SIZE)), 1
+                )
+                blocks = tile * blocks_per_tile + tl.arange(0, blocks_per_tile)
+                # Always retain the newest visible block, including a partial pair.
+                scores = tl.where(
+                    (n_vis > 0) & (blocks == (n_vis - 1) // CANDIDATE_BLOCK_SIZE),
+                    float("inf"),
+                    scores,
+                )
+                tl.store(
+                    block_scores_ptr + b * block_scores_stride + blocks,
+                    scores,
+                    blocks < tl.cdiv(L, CANDIDATE_BLOCK_SIZE),
+                )
 
 
 def fp4_index_logits_paged(
@@ -932,12 +1023,16 @@ def fp4_index_logits_paged(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 8,
     return_block_scores: bool = False,
+    use_fp8: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Score visible compressed positions directly from the request table.
 
     The output has graph-stable capacity, but only the first ``lens[b]`` values
     are initialized. Consumers must use the current device-side lengths.
     The FP4 decoding and BF16 rounding are shared with the dense-slot path.
+    ``use_fp8`` fuses E4M3 conversion with a K=128 dot on Hopper. A separate
+    BF16 repair pass overwrites tiles with non-representable inputs before
+    returning, keeping the uncommon fallback out of the fast kernel's registers.
     """
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
     assert table.dtype == torch.uint8 and table.ndim == 2
@@ -979,37 +1074,53 @@ def fp4_index_logits_paged(
     if not batch or not max_len:
         return result
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    workers = min(triton.cdiv(max_len, 64), triton.cdiv(num_sms * 4, batch))
-    _fp4_index_logits_paged_kernel[(batch, workers)](
-        q,
-        weights,
-        req,
-        req_table,
-        lens,
-        table,
-        candidate_mask,
-        out,
-        candidate_blocks,
-        block_scores,
-        max_len,
-        page_size,
-        table.stride(0),
-        req_table.stride(0),
-        candidate_mask.stride(0) if candidate_mask is not None else 0,
-        out.stride(0),
-        candidate_blocks.stride(0) if candidate_blocks is not None else 0,
-        block_scores.stride(0) if block_scores is not None else 0,
-        q.stride(0),
-        q.stride(1),
-        weights.stride(0),
-        H=heads,
-        HALF_D=INDEX_HEAD_DIM // 2,
-        RATIO=ratio,
-        HAS_MASK=candidate_mask is not None,
-        USE_CANDIDATES=candidate_blocks is not None,
-        CANDIDATE_BLOCK_SIZE=candidate_block_size,
-        WRITE_BLOCK_SCORES=return_block_scores,
-        BLOCK_L=64,
-        num_warps=4,
+    block_l = 128 if use_fp8 and heads == 32 else 64
+    waves = 8 if use_fp8 and heads == 32 else 4
+    workers = min(triton.cdiv(max_len, block_l), triton.cdiv(num_sms * waves, batch))
+    # The extra byte per score tile fits in the selection-scratch reserve.
+    repair = (
+        torch.empty(
+            (batch, triton.cdiv(max_len, block_l)), dtype=torch.uint8, device=q.device
+        )
+        if use_fp8
+        else None
     )
+    # Use the caller's stream for both passes; no selection or publication may
+    # consume the provisional FP8 scores before the BF16 repairs complete.
+    for repair_pass in range(2 if use_fp8 else 1):
+        _fp4_index_logits_paged_kernel[(batch, workers)](
+            q,
+            weights,
+            req,
+            req_table,
+            lens,
+            table,
+            candidate_mask,
+            out,
+            candidate_blocks,
+            block_scores,
+            repair,
+            max_len,
+            page_size,
+            table.stride(0),
+            req_table.stride(0),
+            candidate_mask.stride(0) if candidate_mask is not None else 0,
+            out.stride(0),
+            candidate_blocks.stride(0) if candidate_blocks is not None else 0,
+            block_scores.stride(0) if block_scores is not None else 0,
+            q.stride(0),
+            q.stride(1),
+            weights.stride(0),
+            H=heads,
+            HALF_D=INDEX_HEAD_DIM // 2,
+            RATIO=ratio,
+            HAS_MASK=candidate_mask is not None,
+            USE_CANDIDATES=candidate_blocks is not None,
+            CANDIDATE_BLOCK_SIZE=candidate_block_size,
+            WRITE_BLOCK_SCORES=return_block_scores,
+            BLOCK_L=block_l,
+            USE_FP8=use_fp8 and not repair_pass,
+            REPAIR_FP8=bool(repair_pass),
+            num_warps=4,
+        )
     return result

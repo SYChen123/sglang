@@ -21,6 +21,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 
 from .types import CandidateMetadata, DecodeInputs
 
@@ -125,6 +126,7 @@ def compact_decode(
             candidate_blocks=blocks[rows] if blocks is not None else None,
             candidate_block_size=block_size,
             return_block_scores=published is None,
+            use_fp8=envs.SGLANG_OPT_DSV41_DECODE_INDEXER_FP8.get(),
         )
         if published is None:
             scores, block_scores = scores
