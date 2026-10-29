@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 # Only the final [query, key] FP32 scores are materialized. Leave headroom for
 # candidate selection and top-k scratch; this does not change model prefill size.
-_SCORE_BUDGET_BYTES = 64 << 20
+_SCORE_BUDGET_BYTES = 2048 << 20
 
 
 def use_sm90_prefill(inputs: PrefillInputs) -> bool:

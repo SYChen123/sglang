@@ -25,7 +25,7 @@ from sglang.srt.environ import envs
 
 from .types import CandidateMetadata, DecodeInputs
 
-_SCORE_BUDGET_BYTES = 128 << 20
+_SCORE_BUDGET_BYTES = 512 << 20
 
 
 def _score_rows_per_chunk(width: int, *, block_size: int | None) -> int:
