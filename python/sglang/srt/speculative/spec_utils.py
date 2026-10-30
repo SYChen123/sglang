@@ -707,8 +707,15 @@ def build_grammar_vocab_mask(
     overlaps that forward. ``barrier`` advances the previous batch's FSM over its
     committed tokens, which the traversal then reads, so it has to run first.
     """
+    # Clear an extend-stage mask even if the barrier releases the last grammar.
+    sampling_info.grammar_mask = None
+    if not any(req.grammar is not None for req in reqs):
+        return None
     if barrier is not None:
         barrier()
+    if not any(req.grammar is not None for req in reqs):
+        # No mask needs the current draft's host copy after thinking finishes.
+        return None
     vocab_mask, grammar = generate_token_bitmask(
         reqs,
         *tree.resolve(),
@@ -720,8 +727,6 @@ def build_grammar_vocab_mask(
     # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
     # order keeps the copy ahead of the sampler's apply_vocab_mask.
     vocab_mask = vocab_mask.to(device, non_blocking=True)
-    # Otherwise the extend stage's leftover mask is applied instead.
-    sampling_info.grammar_mask = None
     return GrammarMask(grammar, vocab_mask)
 
 

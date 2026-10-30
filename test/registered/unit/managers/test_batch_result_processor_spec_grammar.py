@@ -9,16 +9,19 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     SamplingParams,
 )
+from sglang.srt.speculative.spec_utils import GrammarTree, build_grammar_vocab_mask
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,6 +41,17 @@ class _FakeGrammar:
 
     def is_terminated(self) -> bool:
         return len(self.accepted) >= self._terminate_after
+
+
+class _CopyDone:
+    def __init__(self, *, allow_wait=True):
+        self.allow_wait = allow_wait
+        self.waits = 0
+
+    def synchronize(self):
+        if not self.allow_wait:
+            raise AssertionError("Unconstrained generation waited on a grammar event")
+        self.waits += 1
 
 
 class _FakeSpecAlgorithm:
@@ -154,6 +168,99 @@ def _commit_disagg_handoff(
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
+    def test_thinking_end_releases_grammar_without_waiting_for_next_tree(self):
+        """A committed multi-token closer must end grammar-only barriers, including
+        on queued snapshots and on the unchanged running-batch filter path.
+        """
+        req = _make_req(terminate_after=99)
+        req.grammar = ReasonerGrammarObject(grammar=None, think_end_ids=[7, 8])
+        req.grammar.maybe_init_reasoning(True)
+        proc = _make_processor()
+        batch = ScheduleBatch(
+            reqs=[req],
+            has_grammar=True,
+            forward_mode=ForwardMode.DECODE,
+            spec_algorithm=_FakeSpecAlgorithm(),
+        )
+        queued = batch.copy()
+
+        first = _make_result(4, [2], [10, 7, 0, 0])
+        self.assertEqual(proc._resolve_spec_v2_tokens(first, queued), [[10, 7]])
+        self.assertIsNotNone(req.grammar)  # The multi-token closer is incomplete.
+
+        previous = _make_result(4, [3], [8, 20, 21, 0])
+        previous.copy_done = _CopyDone()
+        # The current verify-tree D2H is still pending. Its contents are no
+        # longer needed once the previous accepted run finishes thinking.
+        tree = GrammarTree((None, None, None), _CopyDone(allow_wait=False))
+        sampling_info = SimpleNamespace(vocab_size=128, grammar_mask=object())
+        mask = build_grammar_vocab_mask(
+            reqs=batch.reqs,
+            tree=tree,
+            sampling_info=sampling_info,
+            device="cpu",
+            barrier=lambda: proc.advance_grammar_fsm(previous, queued),
+        )
+        self.assertIsNone(mask)
+        self.assertIsNone(sampling_info.grammar_mask)
+        self.assertEqual(previous.copy_done.waits, 1)
+        self.assertIsNone(req.grammar)
+        self.assertEqual(proc._resolve_spec_v2_tokens(previous, queued), [[8, 20, 21]])
+        self.assertEqual(req.kv.kv_committed_len, 5)
+
+        # No request was removed, so filter_batch's old early return left the
+        # running batch's cached grammar flag stuck at True.
+        batch.filter_batch(keep_indices=[0])
+        self.assertFalse(batch.has_grammar)
+
+        queued.has_grammar = True  # A separately queued shallow snapshot.
+        pending = _make_result(4, [2], [22, 23, 0, 0])
+        pending.copy_done = _CopyDone(allow_wait=False)
+        proc.advance_grammar_fsm(pending, queued)
+
+        def unexpected_barrier():
+            self.fail("A grammar-free batch invoked the pending-grammar barrier")
+
+        self.assertIsNone(
+            build_grammar_vocab_mask(
+                reqs=batch.reqs,
+                tree=tree,
+                sampling_info=sampling_info,
+                device="cpu",
+                barrier=unexpected_barrier,
+            )
+        )
+        self.assertEqual(proc._resolve_spec_v2_tokens(pending, queued), [[22, 23]])
+        self.assertEqual(req.kv.kv_committed_len, 7)
+
+    def test_thinking_only_release_preserves_inner_grammar_in_mixed_batch(self):
+        """Releasing one strict-only wrapper must retain JSON-style constraints
+        and their accepted-token truncation for the other request.
+        """
+        strict_req = _make_req(terminate_after=99)
+        strict_req.grammar = ReasonerGrammarObject(None, think_end_ids=[7, 8])
+        strict_req.grammar.maybe_init_reasoning(True)
+        strict_req.grammar.accept_token(7)
+
+        constrained_req = _make_req(terminate_after=99)
+        inner = _FakeGrammar(terminate_after=2)
+        constrained_req.grammar = ReasonerGrammarObject(inner, think_end_ids=[7, 8])
+        constrained_req.grammar.maybe_init_reasoning(False)
+        proc = _make_processor()
+        batch = _FakeBatch([strict_req, constrained_req])
+        result = _make_result(4, [3, 3], [8, 20, 21, 0, 101, 102, 103, 0])
+        result.copy_done = _CopyDone()
+
+        self.assertEqual(
+            proc._resolve_spec_v2_tokens(result, batch), [[8, 20, 21], [101, 102]]
+        )
+        self.assertIsNone(strict_req.grammar)
+        self.assertIs(constrained_req.grammar.grammar, inner)
+        self.assertTrue(batch.has_grammar)
+        self.assertEqual(inner.accepted, [101, 102])
+        self.assertEqual(strict_req.kv.kv_committed_len, 3)
+        self.assertEqual(constrained_req.kv.kv_committed_len, 2)
+
     def test_resolve_truncates_after_grammar_completion(self):
         req = _make_req(terminate_after=2)
         proc = _make_processor()

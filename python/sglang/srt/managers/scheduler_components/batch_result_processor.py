@@ -15,6 +15,7 @@ from typing import (
 import numpy as np
 import torch
 
+from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
@@ -801,8 +802,8 @@ class SchedulerBatchResultProcessor:
 
         # Advance the grammar FSM over this batch's committed tokens (idempotent):
         # the EAGLE overlap path already did this inside verify() via the grammar
-        # barrier; otherwise advance now. advance_grammar_fsm self-gates on per-req
-        # grammar (the queued batch.copy() does not carry has_grammar) and consumes
+        # barrier; otherwise advance now. advance_grammar_fsm refreshes grammar
+        # from the shared requests (queued flags can be stale) and consumes
         # result.grammar_retained_tokens below instead of re-advancing.
         self.advance_grammar_fsm(result, batch)
 
@@ -886,6 +887,11 @@ class SchedulerBatchResultProcessor:
         """
         if result.grammar_advanced or not batch.has_grammar:
             return
+        # Queued batches share Req objects but snapshot has_grammar, which can
+        # stay True after a strict-only wrapper has been released.
+        self._release_unconstrained_grammars(batch)
+        if not batch.has_grammar:
+            return
         is_decode = batch.forward_mode.is_decode()
         if not (is_decode or batch.forward_mode.is_extend()):
             return
@@ -905,6 +911,7 @@ class SchedulerBatchResultProcessor:
                 ):
                     continue
                 self._accept_grammar_tokens(req, next_token_ids[i])
+            self._release_unconstrained_grammars(batch)
             result.grammar_advanced = True
             return
 
@@ -924,8 +931,22 @@ class SchedulerBatchResultProcessor:
             # Stop accepting once the grammar terminates so the over-drafted suffix
             # is never committed to KV nor emitted; this advances the FSM.
             retained[i] = self._accept_grammar_tokens(req, accept_tokens)
+        self._release_unconstrained_grammars(batch)
         result.grammar_retained_tokens = retained
         result.grammar_advanced = True
+
+    @staticmethod
+    def _release_unconstrained_grammars(batch: ScheduleBatch) -> None:
+        # Only committed FSM advances reach here, never speculative tree walks.
+        # A wrapper with an inner JSON/regex/etc. grammar must remain attached.
+        for req in batch.reqs:
+            grammar = req.grammar
+            if (
+                isinstance(grammar, ReasonerGrammarObject)
+                and grammar.is_unconstrained()
+            ):
+                req.grammar = None
+        batch.has_grammar = any(req.grammar is not None for req in batch.reqs)
 
     def process_batch_result_idle(
         self,

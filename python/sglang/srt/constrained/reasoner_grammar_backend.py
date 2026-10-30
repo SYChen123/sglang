@@ -101,6 +101,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def _is_generation(self):
         return self.tokens_after_end >= 0
 
+    def is_unconstrained(self) -> bool:
+        """Whether committed reasoning has ended with no following grammar."""
+        return self._is_generation() and self.grammar is None
+
     def transfer_state(self, token: int) -> None:
         if self._is_thinking():
             previous_match = self._matched_think_end_tokens

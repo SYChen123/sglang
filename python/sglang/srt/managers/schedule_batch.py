@@ -3715,10 +3715,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Filter out all requests. Stale tensors are left as-is: is_empty()
             # keys off reqs, so callers drop the batch before a forward reads them.
             self.reqs = []
+            self.has_grammar = False
             self.return_hidden_states = False
             self.return_hidden_states_mode = CaptureHiddenMode.NULL
             return
 
+        # A committed thinking end can release a grammar without removing its
+        # request. Refresh before the unchanged-batch early return as well.
+        self.has_grammar = any(self.reqs[i].grammar is not None for i in keep_indices)
         if len(keep_indices) == len(self.reqs):
             # No need to filter
             return
@@ -3771,7 +3775,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = None
             self.token_ids_logprobs = None
 
-        self.has_grammar = any(req.grammar for req in self.reqs)
         self.return_hidden_states_mode = get_batch_return_hidden_states_mode(self.reqs)
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
