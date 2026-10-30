@@ -625,7 +625,18 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
-            raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
+            if not cfg.enable_tp_lm_head_all_to_all:
+                raise ValueError(
+                    "DSpark with dp attention requires --enable-dp-lm-head or "
+                    "--enable-tp-lm-head-all-to-all."
+                )
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            if not is_deepseek_v4(model_config_of(server_args).hf_config):
+                raise ValueError(
+                    "DSpark TP LM-head all-to-all currently requires a "
+                    "DeepSeek-V4 target and its bundled MoE draft."
+                )
         if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "

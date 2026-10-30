@@ -13,7 +13,10 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.models import deepseek_v4
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+from sglang.srt.models.deepseek_v4_dspark import (
+    DeepseekV4ForCausalLMDSpark,
+    DSparkV4MarkovHead,
+)
 from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -67,6 +70,36 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
             dspark_markov_rank=1,
             num_nextn_predict_layers=1,
         )
+
+    def test_markov_bias_stays_full_vocab_after_dp_lm_head_exchange(self):
+        """A DP row owns full logits; a TP-local bias would correct the wrong tokens."""
+        torch.manual_seed(21)
+        head = DSparkV4MarkovHead.__new__(DSparkV4MarkovHead)
+        nn.Module.__init__(head)
+        head.vocab_size, head.markov_rank = 17, 4
+        head._is_dsv41 = False
+        head._opt_markov_w2_bf16 = False
+        head._opt_markov_w2_tp_shard = True
+        head.markov_w1 = nn.Embedding(17, 4)
+        head.markov_w2 = nn.Linear(4, 17, bias=False)
+        lm_head = SimpleNamespace(
+            org_vocab_size=17,
+            tp_size=4,
+            num_embeddings_per_partition=5,
+            num_embeddings_padded=20,
+            use_attn_tp_group=False,
+            shard_indices=SimpleNamespace(
+                org_vocab_start_index=0, org_vocab_end_index=5
+            ),
+        )
+        with get_parallel().override(enable_tp_lm_head_all_to_all=True):
+            head.configure_tp_shard(lm_head=lm_head)
+        tokens = torch.tensor([3, 9])
+        bias, _ = head.step_bias(tokens, hidden_states=None, state=None)
+        reference = torch.nn.functional.linear(
+            head.markov_w1(tokens), head.markov_w2.weight
+        )
+        torch.testing.assert_close(bias, reference)
 
     def test_disables_shared_fusion_without_enforce(self):
         self._publish(enforce=False)

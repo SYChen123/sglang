@@ -68,6 +68,7 @@ class DraftForwardResult(msgspec.Struct, frozen=True):
     raw_hidden: torch.Tensor
     draft_hidden_3d: torch.Tensor
     can_run_graph: bool
+    dp_num_logits_rows: Optional[list[int]] = None
 
 
 class DraftProposal(msgspec.Struct, frozen=True):
@@ -364,7 +365,20 @@ class DraftBlockProposer:
         self._draft_sampler = draft_sampler
 
     def _base_logits_context(self):
-        return draft_tp_context(self._dp_moe_sync)
+        # TP-sharded vocab projection needs the full TP group, including when
+        # the draft transformer uses DP attention.
+        return draft_tp_context(
+            self._dp_moe_sync
+            and not getattr(self.draft_model, "use_tp_lm_head_all_to_all", False)
+        )
+
+    def _dp_lm_head_rows(self, forward_batch: ForwardBatch) -> Optional[list[int]]:
+        if not getattr(self.draft_model, "use_tp_lm_head_all_to_all", False):
+            return None
+        counts = forward_batch.global_num_tokens_cpu
+        if counts is None or any(n % self.query_token_num for n in counts):
+            raise RuntimeError("DSpark TP LM head requires complete draft DP counts")
+        return [n // self.query_token_num * self.gamma for n in counts]
 
     def propose(
         self,
@@ -417,8 +431,13 @@ class DraftBlockProposer:
                 confidence_raw = draft_sampler.confidence_raw_out[:bs]
         else:
             with self._base_logits_context():
+                logits_kwargs = (
+                    {"dp_num_rows": fwd.dp_num_logits_rows}
+                    if getattr(self.draft_model, "use_tp_lm_head_all_to_all", False)
+                    else {}
+                )
                 base_logits, confidence_features = self.draft_model.compute_base_logits(
-                    fwd.raw_hidden
+                    fwd.raw_hidden, **logits_kwargs
                 )
                 base_logits = base_logits.view(bs, self.gamma, -1)
             draft_block = sample_draft_block(
@@ -474,8 +493,26 @@ class DraftBlockProposer:
         # loc to the draft's kernel-facing ids (no-op on plain pools).
         self.draft_model_runner.kv_index_translator.bind_own_plan(idle_batch)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
+        dp_num_logits_rows = self._dp_lm_head_rows(idle_batch)
         with torch.inference_mode():
-            self.draft_model_runner.forward(idle_batch)
+            result = self.draft_model_runner.forward(idle_batch)
+            folded = (
+                envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
+                and self._draft_sampler is not None
+                and result.can_run_graph
+            )
+            if dp_num_logits_rows is not None and not folded:
+                # Live ranks project after the eager forward. Idle ranks must
+                # join those same collectives before entering target verify.
+                hidden = torch.empty(
+                    (0, self.draft_model.config.hidden_size),
+                    device=device,
+                    dtype=self.draft_model_runner.dtype,
+                )
+                with self._base_logits_context():
+                    self.draft_model.compute_base_logits(
+                        hidden, dp_num_rows=dp_num_logits_rows
+                    )
 
     def _run_forward(
         self,
@@ -553,6 +590,7 @@ class DraftBlockProposer:
             cols=slice(0, query_token_num),
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+        dp_num_logits_rows = self._dp_lm_head_rows(draft_forward_batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         if (
             draft_sampler is not None
@@ -586,6 +624,7 @@ class DraftBlockProposer:
             raw_hidden=model_hidden,
             draft_hidden_3d=draft_hidden_3d,
             can_run_graph=draft_out.can_run_graph,
+            dp_num_logits_rows=dp_num_logits_rows,
         )
 
     def _fill_dp_moe_sync_metadata(

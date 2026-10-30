@@ -1128,12 +1128,7 @@ class LogitsProcessor(nn.Module):
 
     def _tp_lm_head_all_to_all(self, logits: torch.Tensor) -> torch.Tensor:
         """Exchange only the row block owned by each destination DP rank."""
-        logits = logits.contiguous()
-        all_to_all_output = torch.empty_like(logits)
-        get_parallel().tp_group.all_to_all_single(
-            all_to_all_output.view(-1), logits.view(-1)
-        )
-        return _reassemble_tp_lm_head_all_to_all_output(all_to_all_output)
+        return tp_lm_head_all_to_all(logits)
 
     def _scatter_dp_attn_logits(
         self,
@@ -1382,6 +1377,52 @@ class LogitsProcessor(nn.Module):
             input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
+
+
+def tp_lm_head_all_to_all(logits: torch.Tensor) -> torch.Tensor:
+    """Return this DP rank's rows with vocabulary shards in vocabulary order."""
+    logits = logits.contiguous()
+    output = torch.empty_like(logits)
+    get_parallel().tp_group.all_to_all_single(output.view(-1), logits.view(-1))
+    return _reassemble_tp_lm_head_all_to_all_output(output)
+
+
+def compute_dp_tp_lm_head(
+    hidden_states: torch.Tensor,
+    lm_head,
+    compute_logits,
+    *,
+    dp_num_rows: Optional[List[int]] = None,
+) -> torch.Tensor:
+    """Project DP-local rows with TP weights and return DP-local full logits.
+
+    Eager callers supply the same real row counts on every rank, including idle
+    ranks. Graph callers omit counts only when every rank has the same capture
+    bucket. Padding is confined to this exchange, with no GPU-to-CPU count read.
+    """
+    parallel = get_parallel()
+    tp_size = parallel.tp_size
+    if lm_head.tp_size != tp_size:
+        raise ValueError("DP/TP LM head requires weights sharded over the TP group")
+    rows, hidden = hidden_states.shape
+    if dp_num_rows is None:
+        capacity = rows
+    else:
+        if len(dp_num_rows) != tp_size or any(n < 0 for n in dp_num_rows):
+            raise ValueError("DP LM-head row counts must cover every TP rank")
+        if rows != dp_num_rows[parallel.tp_rank]:
+            raise ValueError("Local LM-head rows disagree with the DP row counts")
+        capacity = max(dp_num_rows)
+    if capacity == 0:
+        return compute_logits(hidden_states).new_empty((0, lm_head.org_vocab_size))
+    local = hidden_states.contiguous()
+    if rows < capacity:
+        local = hidden_states.new_zeros((capacity, hidden))
+        local[:rows].copy_(hidden_states)
+    gathered = hidden_states.new_empty((tp_size * capacity, hidden))
+    parallel.tp_group.all_gather_into_tensor(gathered, local)
+    logits = tp_lm_head_all_to_all(compute_logits(gathered))
+    return logits[:rows, : lm_head.org_vocab_size]
 
 
 def _reassemble_tp_lm_head_all_to_all_output(

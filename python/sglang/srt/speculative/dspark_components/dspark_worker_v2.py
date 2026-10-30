@@ -168,6 +168,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         self._draft_is_moe = draft_is_deepseek_v4()
+        if get_parallel().enable_tp_lm_head_all_to_all and not self._draft_is_moe:
+            raise ValueError(
+                "DSpark TP LM-head all-to-all requires the DeepSeek-V4 MoE draft."
+            )
         self._draft_dp_context_enabled = (
             get_parallel().attn_dp_enabled and not self._draft_is_moe
         )

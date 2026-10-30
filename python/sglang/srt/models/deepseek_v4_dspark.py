@@ -20,7 +20,10 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    compute_dp_tp_lm_head,
+)
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -416,6 +419,13 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         self._shard_group = None
 
     def configure_tp_shard(self, *, lm_head: nn.Module) -> None:
+        if get_parallel().enable_tp_lm_head_all_to_all:
+            # The LM-head exchange has already returned each request's complete
+            # vocabulary. Keep the small Markov head local: its preceding tokens
+            # belong to different requests on different DP ranks.
+            self._tp_shard = None
+            self.vocab_shard = None
+            return
         if not self._opt_markov_w2_tp_shard:
             return
         if int(lm_head.org_vocab_size) != self.vocab_size:
@@ -861,6 +871,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             self.embed_tokens: Optional[nn.Module] = None
             self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
+        self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
         if self.lm_head is not None:
             self.markov_head.configure_tp_shard(lm_head=self.lm_head)
@@ -972,26 +983,45 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def compute_base_logits(
+        self, x: torch.Tensor, *, dp_num_rows: Optional[List[int]] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.use_tp_lm_head_all_to_all and x.shape[0] == 0:
+            # An idle DP rank still owns a vocabulary shard for live peers.
+            # Avoid launching MHC/norm kernels on zero local rows.
+            hidden = x.new_empty((0, self.config.hidden_size))
+            return self._logits_from_normalized_hidden(hidden, dp_num_rows), hidden
         x_post_hc = self.collapse_hc_head(x)
-        return self._logits_from_x_post_hc(x_post_hc), x_post_hc
+        return self._logits_from_x_post_hc(x_post_hc, dp_num_rows), x_post_hc
 
-    def _logits_from_x_post_hc(self, x_post_hc: torch.Tensor) -> torch.Tensor:
+    def _logits_from_x_post_hc(
+        self, x_post_hc: torch.Tensor, dp_num_rows: Optional[List[int]] = None
+    ) -> torch.Tensor:
+        x = self.stages[-1].norm(x_post_hc)
+        return self._logits_from_normalized_hidden(x, dp_num_rows)
+
+    def _logits_from_normalized_hidden(
+        self, x: torch.Tensor, dp_num_rows: Optional[List[int]]
+    ) -> torch.Tensor:
         if self.lm_head is None:
             raise ValueError(
                 "DeepseekV4ForCausalLMDSpark requires the target lm_head "
                 "(call attach_shared_modules first)."
             )
-        last = self.stages[-1]
-        x = last.norm(x_post_hc)
-        weight = self.lm_head.weight
-        if self._use_fp32_lm_head and weight.is_floating_point():
-            local_logits = F.linear(x.float(), weight.float())
-        else:
-            local_logits = project_through_lm_head(x, self.lm_head)
+        if self.use_tp_lm_head_all_to_all:
+            return compute_dp_tp_lm_head(
+                x, self.lm_head, self._project_lm_head, dp_num_rows=dp_num_rows
+            )
+        local_logits = self._project_lm_head(x)
         if self._opt_markov_w2_tp_shard:
             return local_logits
         return gather_and_crop_vocab(local_logits, self.lm_head)
+
+    def _project_lm_head(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.lm_head.weight
+        if self._use_fp32_lm_head and weight.is_floating_point():
+            return F.linear(x.float(), weight.float())
+        return project_through_lm_head(x, self.lm_head)
 
     def compute_confidence(
         self,
