@@ -36,12 +36,20 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "--enable-single-batch-overlap."
         )
     platform = get_platform()
+    if platform.is_sm90 and (
+        cfg.enable_w4a4_mxfp4_megamoe or cfg.speculative_enable_w4a4_mxfp4_megamoe
+    ):
+        raise ValueError(
+            "SM90 MegaMoE supports FP8 activations (W4A8 / W8A8), not W4A4. "
+            "Disable --enable-w4a4-mxfp4-megamoe and "
+            "--speculative-enable-w4a4-mxfp4-megamoe."
+        )
     if not (
         (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
         or platform.is_hip
     ):
         raise ValueError(
-            "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
+            "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (packed-FP4 or block-FP8 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
             "kernels over CUDA symmetric memory. On ROCm, set "
             "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."

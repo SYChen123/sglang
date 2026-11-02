@@ -405,6 +405,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        if self.use_mega_moe and get_platform().is_sm90:
+            # Hopper MegaMoE owns preparation; standalone FlashInfer helpers
+            # are not a prerequisite for this path.
+            self.use_flashinfer = False
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -664,6 +668,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
             layer._mxfp4_backend = "marlin"
+            return
+
+        if self.use_mega_moe and get_platform().is_sm90:
+            from sglang.srt.layers.moe.mega_moe_sm90 import (
+                build_sm90_fp4_mega_moe_experts_weights,
+            )
+
+            build_sm90_fp4_mega_moe_experts_weights(
+                layer, scale_names=("w13_weight_scale", "w2_weight_scale")
+            )
+            layer._mxfp4_backend = "deep_gemm"
             return
 
         if self.use_deep_gemm or self.use_mega_moe:

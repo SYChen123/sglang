@@ -424,6 +424,15 @@ class Fp8Config(QuantizationConfig):
 
             if (
                 self.is_fp4_experts
+                and get_platform().is_sm90
+                and get_moe_a2a_backend().is_megamoe()
+            ):
+                # MegaMoE owns the expert layout even if a standalone runner
+                # such as Humming is selected for non-MegaMoE layers.
+                return fp8_method
+
+            if (
+                self.is_fp4_experts
                 and is_npu_arch35()
                 # NPUW4A4Fp4MoEMethod is DSV4-specific (deepep dispatch,
                 # swiglu_limit); other FP4-expert checkpoints fall through
@@ -2078,6 +2087,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
+
+            if (
+                self.is_fp4_expert
+                and not self.dequant_fp4_to_fp8
+                and get_platform().is_sm90
+                and get_moe_a2a_backend().is_megamoe()
+            ):
+                from sglang.srt.layers.moe.mega_moe_sm90 import (
+                    build_sm90_fp4_mega_moe_experts_weights,
+                )
+
+                build_sm90_fp4_mega_moe_experts_weights(layer)
+                return
 
             if self.is_fp4_expert and self.dequant_fp4_to_fp8:
                 for weight_param, scale_param in [

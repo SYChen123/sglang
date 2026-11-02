@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""SM90 FP8 Mega-MoE forward path and expert-weight prep."""
+"""SM90 W8A8 / packed-W4A8 MegaMoE forward and expert-weight preparation."""
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from sglang.srt.models.deepseek_common.utils import _device_sm
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
+
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def is_sm90_fp8_mega_moe_available(experts) -> bool:
@@ -39,6 +41,24 @@ def is_sm90_fp8_mega_moe_available(experts) -> bool:
     )
 
 
+def is_sm90_fp4_mega_moe_available(experts) -> bool:
+    if _device_sm != 90 or not getattr(experts, "_mega_moe_sm90_fp4_weights", False):
+        return False
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    # The generic fp8_fp4_mega_moe symbol also exists in SM100-only builds.
+    return all(
+        hasattr(deep_gemm, name)
+        for name in (
+            "fp8_fp4_mega_moe",
+            "mega_moe_pre_dispatch_sm90",
+            "transform_weights_for_mega_moe_sm90_fp4",
+        )
+    )
+
+
 def run_sm90_mega_routed(
     experts,
     hidden_states: torch.Tensor,
@@ -50,13 +70,14 @@ def run_sm90_mega_routed(
     hidden_size: int,
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
+    forward_batch: Optional[ForwardBatch] = None,
 ) -> torch.Tensor:
     import deep_gemm
 
     deep_gemm.mega_moe_pre_dispatch_sm90(
-        hidden_states,
-        topk_ids,
-        topk_weights,
+        hidden_states.contiguous(),
+        topk_ids.contiguous(),
+        topk_weights.contiguous(),
         buf.x,
         buf.x_sf,
         buf.topk_idx,
@@ -71,15 +92,37 @@ def run_sm90_mega_routed(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    deep_gemm.fp8_mega_moe(
+    use_fp4 = getattr(experts, "_mega_moe_sm90_fp4_weights", False)
+    mega_moe = deep_gemm.fp8_fp4_mega_moe if use_fp4 else deep_gemm.fp8_mega_moe
+    l1, l2 = experts.mega_l1_weights, experts.mega_l2_weights
+    rs_max_tokens = getattr(experts, "_mega_moe_sm90_fp4_tail_rs_max_tokens", 0)
+    kernel_options = {}
+    use_rs = False
+    if (
+        use_fp4
+        and 0 < num_tokens <= rs_max_tokens
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_extend_without_speculative()
+    ):
+        cp_rows = getattr(forward_batch.attn_cp_metadata, "per_rank_actual_token", None)
+        # RS changes the CTA count. All EP ranks must agree on the kernel.
+        use_rs = cp_rows == [num_tokens] * 4
+    if use_fp4 and l1[0].ndim == 4:
+        # Paired weights select RS by default. Oversized or nonuniform batches
+        # use the SS decoder on the same storage.
+        kernel_options["use_sm90_packed_ss"] = not use_rs
+    elif use_rs:
+        kernel_options["use_sm90_register_weights"] = True
+    mega_moe(
         y,
-        experts.mega_l1_weights,
-        experts.mega_l2_weights,
+        l1,
+        l2,
         buf,
-        recipe=(128, 128, 128),
+        recipe=(1, 1, 32) if use_fp4 else (128, 128, 128),
         activation="swiglu",
         activation_clamp=activation_clamp,
         fast_math=True,
+        **kernel_options,
     )
     y = y[:num_tokens]
 
@@ -146,4 +189,113 @@ def build_sm90_mega_moe_experts_weights(experts) -> None:
     )
 
     experts._mega_moe_sm90_fp8_weights = True
+    experts._mega_moe_weights_built = True
+
+
+def build_sm90_fp4_mega_moe_experts_weights(
+    experts,
+    *,
+    scale_names: tuple[str, str] = ("w13_weight_scale_inv", "w2_weight_scale_inv"),
+) -> None:
+    """Keep packed E2M1 weights; pack K32 scales for the Hopper fused kernel.
+
+    The DeepGEMM PR #53 transform interleaves gate/up in gran-8 rows and packs
+    four UE8M0 bytes per int32 along K. This is not SM100's MN-major SF layout.
+    Prefill tail layers can use paired-row FP4 storage. Replace parameters
+    before KV sizing so each layer retains one weight layout.
+    """
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+    if getattr(experts, "_mega_moe_w4a4", False):
+        raise ValueError(
+            "SM90 MegaMoE supports W4A8, not FP4 activations; disable "
+            "--enable-w4a4-mxfp4-megamoe and its speculative counterpart."
+        )
+    config = getattr(experts, "moe_runner_config", None)
+    if config is not None and (
+        config.activation not in ("silu", "swiglu")
+        or not config.is_gated
+        or config.gemm1_alpha is not None
+        or config.apply_router_weight_on_input
+        or getattr(experts, "with_bias", False)
+    ):
+        raise ValueError(
+            "The SM90 W4A8 MegaMoE adapter requires bias-free SwiGLU experts "
+            "with routing weights applied after the down projection."
+        )
+    import deep_gemm
+
+    if not all(
+        hasattr(deep_gemm, name)
+        for name in (
+            "fp8_fp4_mega_moe",
+            "mega_moe_pre_dispatch_sm90",
+            "transform_weights_for_mega_moe_sm90_fp4",
+        )
+    ):
+        raise RuntimeError(
+            "SM90 W4A8 MegaMoE requires a build of DeepGEMM PR #53 "
+            "(b5675bf7c812a583d6eadabfa23ad1e00207c39d). The released "
+            "SM100-only fp8_fp4_mega_moe API is insufficient; see "
+            "3rdparty/DeepGEMM and scripts/sm90_w4a8_megamoe/README.md."
+        )
+
+    w13, w2 = experts.w13_weight.data, experts.w2_weight.data
+    scales = [getattr(experts, name) for name in scale_names]
+    for weight, scale in zip((w13, w2), scales):
+        if weight.dtype not in (torch.int8, torch.uint8):
+            raise ValueError("SM90 W4A8 MegaMoE requires packed E2M1 expert weights")
+        e, n, packed_k = weight.shape
+        if packed_k % 64 or scale.shape != (e, n, packed_k // 16):
+            raise ValueError(
+                "SM90 W4A8 MegaMoE requires K aligned to 128 and per-row K32 "
+                f"scales; got weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
+            )
+    if w13.shape[0] != w2.shape[0] or w13.shape[1] != w2.shape[2] * 4:
+        raise ValueError("SM90 W4A8 MegaMoE requires matching gate/up and down experts")
+    if w13.shape[2] * 2 != w2.shape[1]:
+        raise ValueError("SM90 W4A8 MegaMoE hidden dimensions do not match")
+    if not 0 < w2.shape[2] * 2 <= 4096:
+        raise ValueError("SM90 W4A8 MegaMoE requires 0 < intermediate_size <= 4096")
+
+    fp32_scales = []
+    for scale in scales:
+        if scale.dtype == torch.uint8:
+            fp32_scales.append(scale.data.view(torch.float8_e8m0fnu).float())
+        elif scale.dtype == torch.float32:
+            fp32_scales.append(scale.data)
+        else:
+            raise ValueError(
+                f"Expected FP32 or raw UE8M0 expert scales, got {scale.dtype}"
+            )
+
+    tail_rs = (
+        getattr(experts, "_mega_moe_sm90_fp4_enable_tail_rs", False)
+        and w13.shape == (96, 4608, 2560)
+        and w2.shape == (96, 5120, 1152)
+    )
+    pack_tail_rs = tail_rs and getattr(
+        experts, "_mega_moe_sm90_fp4_pack_tail_rs", False
+    )
+    transform_options = {"pack_for_register_weights": True} if pack_tail_rs else {}
+    l1, l2 = deep_gemm.transform_weights_for_mega_moe_sm90_fp4(
+        (w13.view(torch.int8), fp32_scales[0]),
+        (w2.view(torch.int8), fp32_scales[1]),
+        **transform_options,
+    )
+    if pack_tail_rs:
+        experts._mega_moe_sm90_fp4_tail_rs_max_tokens = (
+            deep_gemm.get_sm90_fp4_register_max_tokens()
+        )
+    elif tail_rs:
+        max_tokens = getattr(deep_gemm, "get_sm90_fp4_row_major_rs_max_tokens", None)
+        if max_tokens is not None:
+            experts._mega_moe_sm90_fp4_tail_rs_max_tokens = max_tokens()
+    experts.w13_weight.data, scales[0].data = l1
+    experts.w2_weight.data, scales[1].data = l2
+    for scale in scales:
+        scale.format_ue8m0 = True
+    experts.mega_l1_weights = (experts.w13_weight.data, scales[0].data)
+    experts.mega_l2_weights = (experts.w2_weight.data, scales[1].data)
+    experts._mega_moe_sm90_fp4_weights = True
     experts._mega_moe_weights_built = True
