@@ -1,0 +1,22 @@
+{
+  "pr": "https://github.com/sgl-project/DeepGEMM/pull/53",
+  "repository": "https://github.com/qiushixiaoyu/DeepGEMM.git",
+  "branch": "fp4_swapAB",
+  "commit": "b5675bf7c812a583d6eadabfa23ad1e00207c39d",
+  "path": "3rdparty/DeepGEMM",
+  "local_port": {
+    "path": "../DeepGEMM",
+    "repository": "https://code.alipay.com/csy512356/DeepGEMM.git",
+    "branch": "0.2.2-sm90-megamoe",
+    "base_tag": "v0.2.2",
+    "base_commit": "ec226bcf400c11d62755137b916fae9ee359c684",
+    "kernel_port_commit": "100525e83ded00e25795712cf42bb8ffdb4bcc5c",
+    "commit": "3d47168f6015c7d454c4ec0f4e41db3c388dca2c",
+    "dependencies_storage": "vendored source files, not submodules"
+  },
+  "submodules": {
+    "third-party/cutlass": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8",
+    "third-party/deep_jit": "e5bdee2bc4ca519eba00cfc5f0c6e950e6a96a16"
+  },
+  "upstream_sglang_reference": "https://github.com/qiushixiaoyu/sglang/commit/8e7e06bfe92aff194efd84a4d28ea683a766ed66"
+}

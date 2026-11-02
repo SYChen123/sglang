@@ -13,7 +13,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend, mega_moe
+from sglang.srt.layers.moe import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    mega_moe,
+    mega_moe_sm90,
+)
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
 from sglang.srt.layers.moe.topk import TopKConfig
@@ -194,6 +199,209 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         call = deep_gemm.transform_weights_for_mega_moe.call_args
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
+
+    def test_sm90_fp4_loading_keeps_packed_storage_and_replaces_layout(self):
+        """Do not retain a second expert layout or expand the experts to FP8."""
+        for raw_scales in (False, True):
+            with self.subTest(raw_ue8m0=raw_scales):
+                names = (
+                    ("w13_weight_scale", "w2_weight_scale")
+                    if raw_scales
+                    else ("w13_weight_scale_inv", "w2_weight_scale_inv")
+                )
+                experts = SimpleNamespace(
+                    w13_weight=torch.nn.Parameter(
+                        torch.zeros((1, 256, 64), dtype=torch.int8), requires_grad=False
+                    ),
+                    w2_weight=torch.nn.Parameter(
+                        torch.zeros((1, 128, 64), dtype=torch.int8), requires_grad=False
+                    ),
+                )
+                for name, n in zip(names, (256, 128)):
+                    setattr(
+                        experts,
+                        name,
+                        torch.nn.Parameter(
+                            torch.full(
+                                (1, n, 4),
+                                127 if raw_scales else 1.0,
+                                dtype=torch.uint8 if raw_scales else torch.float32,
+                            ),
+                            requires_grad=False,
+                        ),
+                    )
+                transformed = (
+                    (
+                        torch.ones_like(experts.w13_weight),
+                        torch.zeros((1, 256, 1), dtype=torch.int32),
+                    ),
+                    (
+                        torch.ones_like(experts.w2_weight),
+                        torch.zeros((1, 128, 1), dtype=torch.int32),
+                    ),
+                )
+                dg = self.deep_gemm
+                dg.fp8_fp4_mega_moe = MagicMock()
+                dg.mega_moe_pre_dispatch_sm90 = MagicMock()
+                dg.transform_weights_for_mega_moe_sm90_fp4 = MagicMock(
+                    return_value=transformed
+                )
+                with patch.dict(sys.modules, {"deep_gemm": dg}):
+                    mega_moe_sm90.build_sm90_fp4_mega_moe_experts_weights(
+                        experts, scale_names=names
+                    )
+                    # Re-entering weight preparation must not interleave twice.
+                    mega_moe_sm90.build_sm90_fp4_mega_moe_experts_weights(
+                        experts, scale_names=names
+                    )
+                dg.transform_weights_for_mega_moe_sm90_fp4.assert_called_once()
+                for param, scale_name, pair in zip(
+                    (experts.w13_weight, experts.w2_weight), names, transformed
+                ):
+                    self.assertEqual(param.dtype, torch.int8)
+                    self.assertEqual(param.data_ptr(), pair[0].data_ptr())
+                    self.assertEqual(
+                        getattr(experts, scale_name).data_ptr(), pair[1].data_ptr()
+                    )
+                    self.assertTrue(getattr(experts, scale_name).format_ue8m0)
+                self.assertTrue(experts._mega_moe_sm90_fp4_weights)
+                self.assertTrue(experts._mega_moe_weights_built)
+                # Raw checkpoint exponents become exact powers of two for the
+                # upstream transform, not the SM100 MN-major scale layout.
+                for pair in dg.transform_weights_for_mega_moe_sm90_fp4.call_args.args:
+                    self.assertEqual(pair[1].dtype, torch.float32)
+                    self.assertTrue(torch.equal(pair[1], torch.ones_like(pair[1])))
+
+    def test_sm90_fp4_rejects_old_api_and_fp4_activations(self):
+        dg = ModuleType("deep_gemm")
+        dg.fp8_fp4_mega_moe = MagicMock()  # SM100 symbol alone is insufficient.
+        experts = SimpleNamespace(_mega_moe_sm90_fp4_weights=True)
+        with (
+            patch.dict(sys.modules, {"deep_gemm": dg}),
+            patch.object(mega_moe_sm90, "_device_sm", 90),
+        ):
+            self.assertFalse(mega_moe_sm90.is_sm90_fp4_mega_moe_available(experts))
+            with self.assertRaisesRegex(RuntimeError, "DeepGEMM PR #53"):
+                mega_moe_sm90.build_sm90_fp4_mega_moe_experts_weights(experts)
+            experts._mega_moe_w4a4 = True
+            with self.assertRaisesRegex(ValueError, "not FP4 activations"):
+                mega_moe_sm90.build_sm90_fp4_mega_moe_experts_weights(experts)
+
+    def test_sm90_fp4_local_rows_empty_rank_and_graph_buffer_reuse(self):
+        dg = self.deep_gemm
+        self.max_num_sms.return_value = None
+        buf = SimpleNamespace(
+            x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+        )
+        dg.get_symm_buffer_for_mega_moe = MagicMock(return_value=buf)
+        dg.mega_moe_pre_dispatch_sm90 = MagicMock()
+        dg.transform_weights_for_mega_moe_sm90_fp4 = MagicMock()
+        dg.fp8_fp4_mega_moe = MagicMock(side_effect=lambda y, *_a, **_k: y.fill_(7))
+        dg.fp8_mega_moe = MagicMock(side_effect=lambda y, *_a, **_k: y.fill_(5))
+        experts = SimpleNamespace(
+            num_experts=8,
+            _mega_moe_nvfp4=False,
+            _mega_moe_w4a4=False,
+            _mega_moe_weights_built=True,
+            _mega_moe_sm90_fp4_weights=True,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+        )
+        from sglang.srt.environ import envs
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": dg}),
+            patch.object(mega_moe, "_device_sm", 90),
+            get_parallel().override(
+                moe_ep_group=SimpleNamespace(device_group=object())
+            ),
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(8),
+        ):
+            # Zero rows must still enter both distributed kernels. Physical
+            # graph buckets are passed intact; logical pad ids remain -1.
+            for rows in (0, 2, 8, 2):
+                ids = torch.full((rows, 2), -1, dtype=torch.int64)
+                hidden = torch.zeros((rows * 2, 128), dtype=torch.bfloat16)[::2]
+                out = mega_moe.run_mega_routed_experts(
+                    experts,
+                    hidden,
+                    ids,
+                    torch.zeros((rows, 2), dtype=torch.bfloat16),
+                    hidden_size=128,
+                    intermediate_size=128,
+                    top_k=2,
+                    num_tokens=rows,
+                    activation_clamp=10.0,
+                    routed_scaling_factor=1.5,
+                )
+                self.assertEqual(out.shape, (rows, 128))
+                self.assertTrue(torch.equal(out, torch.full_like(out, 7)))
+                pre = dg.mega_moe_pre_dispatch_sm90.call_args
+                self.assertEqual(pre.kwargs["num_tokens"], rows)
+                self.assertEqual(pre.kwargs["group_size"], 128)
+                self.assertEqual(pre.kwargs["routed_scaling_factor"], 1.5)
+                self.assertTrue(pre.args[0].is_contiguous())
+                self.assertTrue(torch.equal(pre.args[0], hidden))
+                self.assertTrue(torch.equal(pre.args[1], ids.to(torch.int32)))
+                self.assertEqual(
+                    dg.fp8_fp4_mega_moe.call_args.kwargs["recipe"], (1, 1, 32)
+                )
+                self.assertEqual(
+                    dg.fp8_fp4_mega_moe.call_args.args[0].shape[0], max(rows, 1)
+                )
+            dg.get_symm_buffer_for_mega_moe.assert_called_once()
+            experts._mega_moe_sm90_fp4_weights = False
+            out = mega_moe.run_mega_routed_experts(
+                experts,
+                torch.zeros((2, 128), dtype=torch.bfloat16),
+                torch.zeros((2, 2), dtype=torch.int64),
+                torch.ones((2, 2)),
+                hidden_size=128,
+                intermediate_size=128,
+                top_k=2,
+                num_tokens=2,
+            )
+            self.assertTrue(torch.equal(out, torch.full_like(out, 5)))
+            self.assertEqual(
+                dg.fp8_mega_moe.call_args.kwargs["recipe"], (128, 128, 128)
+            )
+
+    def test_sm90_fp4_cp_local_budget_and_capture_overflow(self):
+        """A CP shard fits independently; a larger captured bucket cannot fall back."""
+        from sglang.srt.environ import envs
+
+        dg = self.deep_gemm
+        dg.fp8_fp4_mega_moe = MagicMock()
+        dg.mega_moe_pre_dispatch_sm90 = MagicMock()
+        dg.transform_weights_for_mega_moe_sm90_fp4 = MagicMock()
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(
+                _mega_moe_weights_built=True, _mega_moe_sm90_fp4_weights=True
+            )
+        )
+        with (
+            patch.dict(sys.modules, {"deep_gemm": dg}),
+            patch.object(mega_moe, "_device_sm", 90),
+            patch.object(mega_moe_sm90, "_device_sm", 90),
+            patch.object(mega_moe, "get_dp_global_num_tokens", return_value=[32] * 4),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(8),
+        ):
+            with (
+                patch.object(mega_moe, "get_is_capture_mode", return_value=False),
+                patch.object(mega_moe, "is_dsa_enable_prefill_cp", return_value=True),
+            ):
+                self.assertTrue(
+                    mega_moe.should_use_mega_moe(moe, torch.empty((8, 128)))
+                )
+            with patch.object(mega_moe, "get_is_capture_mode", return_value=True):
+                self.assertTrue(
+                    mega_moe.should_use_mega_moe(moe, torch.empty((8, 128)))
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "fallback would use repacked"
+                ):
+                    mega_moe.should_use_mega_moe(moe, torch.empty((9, 128)))
 
     def test_mxf4_pre_dispatch_uses_typed_api(self):
         deep_gemm = ModuleType("deep_gemm")

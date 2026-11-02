@@ -27,6 +27,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
+    is_sm90_fp4_mega_moe_available,
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
 )
@@ -162,7 +163,9 @@ def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
     if _device_sm == 90:
-        return is_sm90_fp8_mega_moe_available(experts)
+        return is_sm90_fp4_mega_moe_available(
+            experts
+        ) or is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
     return _device_sm // 10 == 10
 
@@ -179,16 +182,29 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not is_mega_moe_experts_ready(moe.experts):
         return False
-    if get_is_capture_mode():
+    capture = get_is_capture_mode()
+    if capture and not getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False):
         return True
 
-    global_num_tokens = get_dp_global_num_tokens()
+    # BCG and decode graphs may capture a bucket larger than the real batch.
+    # The packed SM90 path must cover those physical rows, too.
+    global_num_tokens = None if capture else get_dp_global_num_tokens()
     if global_num_tokens and not is_dsa_enable_prefill_cp():
         max_tokens_per_rank = max(global_num_tokens)
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        if getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False):
+            # Repacked parameters have no ordinary SM90 grouped-GEMM fallback.
+            raise RuntimeError(
+                f"SM90 W4A8 MegaMoE needs {max_tokens_per_rank} tokens per rank, "
+                f"exceeding its configured capacity {cap}. Raise "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK or reduce "
+                "the prefill / CUDA graph bucket; fallback would use repacked weights."
+            )
+        return False
+    return True
 
 
 def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
