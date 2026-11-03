@@ -110,6 +110,135 @@ def finish_paged_indexer_topk(
     )
 
 
+@triton.jit(
+    do_not_specialize=["length", "score_width", "score_row_stride", "block_row_stride"]
+)
+def _finish_prefill_indexer_topk_kernel(
+    Indices,
+    Slots,
+    Tokens,
+    Lengths,
+    Raw,
+    Pages,
+    Scores,
+    CandidateBlocks,
+    length,
+    score_width,
+    score_row_stride,
+    block_row_stride,
+    K: tl.constexpr,
+    IDX_ROW_STRIDE: tl.constexpr,
+    IDX_COL_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    RAW_ROW_STRIDE: tl.constexpr,
+    RAW_COL_STRIDE: tl.constexpr,
+    PAGE_ROW_STRIDE: tl.constexpr,
+    PAGE_COL_STRIDE: tl.constexpr,
+    SCORE_COL_STRIDE: tl.constexpr,
+    BLOCK_COL_STRIDE: tl.constexpr,
+    CANDIDATE_BLOCK_SIZE: tl.constexpr,
+    FILTER_SCORES: tl.constexpr,
+    WRITE_PAGES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.arange(0, BLOCK)
+    idx = tl.load(
+        Indices + row * IDX_ROW_STRIDE + col * IDX_COL_STRIDE, col < K, -1
+    ).to(tl.int32)
+    valid = idx >= 0
+    if FILTER_SCORES:
+        valid &= idx < score_width
+        score = tl.load(
+            Scores + row * score_row_stride + idx * SCORE_COL_STRIDE,
+            valid,
+            -float("inf"),
+        )
+        valid &= score > -float("inf")
+        if CANDIDATE_BLOCK_SIZE:
+            block_id = tl.load(
+                CandidateBlocks
+                + row * block_row_stride
+                + (idx // CANDIDATE_BLOCK_SIZE) * BLOCK_COL_STRIDE,
+                valid,
+                -1,
+            )
+            valid &= block_id >= 0
+            idx = block_id * CANDIDATE_BLOCK_SIZE + idx % CANDIDATE_BLOCK_SIZE
+    token = tl.load(Tokens + row * TOKEN_STRIDE).to(tl.int64)
+    visible = tl.minimum(tl.load(Lengths + row * LENGTH_STRIDE), length)
+    # Compact columns are ordered by candidate list, so sort after remapping.
+    idx = tl.sort(tl.where(valid, idx, length), descending=False)
+    valid = (col < K) & (idx < visible)
+    if WRITE_PAGES:
+        slot = tl.load(Slots + tl.minimum(idx, length - 1) * SLOT_STRIDE, valid, -1)
+        tl.store(
+            Pages + token * PAGE_ROW_STRIDE + col * PAGE_COL_STRIDE,
+            slot,
+            col < K,
+        )
+    tl.store(
+        Raw + token * RAW_ROW_STRIDE + col * RAW_COL_STRIDE,
+        tl.where(valid, idx, -1),
+        col < K,
+    )
+
+
+def finish_prefill_indexer_topk(
+    indices: torch.Tensor,
+    slots: torch.Tensor,
+    tokens: torch.Tensor,
+    lengths: torch.Tensor,
+    raw_indices: torch.Tensor,
+    page_indices: torch.Tensor | None,
+    length: int,
+    *,
+    scores: torch.Tensor | None = None,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 8,
+) -> None:
+    """Filter and remap selected columns, then write sorted positions and KV slots."""
+    rows, k = indices.shape
+    if not rows or not k:
+        return
+    score_row_stride, score_col_stride = (
+        scores.stride() if scores is not None else (0, 0)
+    )
+    block_row_stride, block_col_stride = (
+        candidate_blocks.stride() if candidate_blocks is not None else (0, 0)
+    )
+    _finish_prefill_indexer_topk_kernel[(rows,)](
+        indices,
+        slots,
+        tokens,
+        lengths,
+        raw_indices,
+        page_indices,
+        scores,
+        candidate_blocks,
+        length,
+        scores.shape[1] if scores is not None else 0,
+        score_row_stride,
+        block_row_stride,
+        k,
+        *indices.stride(),
+        slots.stride(0),
+        tokens.stride(0),
+        lengths.stride(0),
+        *raw_indices.stride(),
+        *(page_indices.stride() if page_indices is not None else (0, 0)),
+        score_col_stride,
+        block_col_stride,
+        candidate_block_size if candidate_blocks is not None else 0,
+        scores is not None,
+        page_indices is not None,
+        triton.next_power_of_2(k),
+        num_warps=4,
+    )
+
+
 # Visible key counts change across batches; keep them out of the JIT key.
 @triton.jit(do_not_specialize=["NUM_SLOTS"])
 def _finish_flat_indexer_topk_kernel(

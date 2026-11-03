@@ -290,14 +290,13 @@ class DenseBlocksBackend:
                         out=idx,
                         offsets=torch.zeros_like(chunk.lens),
                     )
-                    selected = idx.long().clamp(0, width - 1)
-                    valid = (idx >= 0) & (chunk.scores.gather(1, selected) > -torch.inf)
-                    blocks = chunk.candidate_blocks.gather(
-                        1, selected // self.block_size
-                    )
-                    logical = blocks * self.block_size + selected % self.block_size
                     write_prefill(
-                        inputs, request, chunk, logical.masked_fill(~valid, -1)
+                        inputs,
+                        request,
+                        chunk,
+                        idx,
+                        filter_scores=True,
+                        candidate_block_size=self.block_size,
                     )
                     continue
                 if chunk.use_ragged_topk:
@@ -305,11 +304,13 @@ class DenseBlocksBackend:
                         published.blocks[chunk.tok], request.lc, self.block_size
                     )
                     chunk.scores.masked_fill_(~keep, -torch.inf)
-                    idx = select_prefill_chunk(chunk, request.k)
-                    valid = idx >= 0
-                    picked_scores = chunk.scores.gather(1, idx.long().clamp_min(0))
-                    idx = idx.masked_fill(~valid | ~(picked_scores > -torch.inf), -1)
-                    write_prefill(inputs, request, chunk, idx)
+                    write_prefill(
+                        inputs,
+                        request,
+                        chunk,
+                        select_prefill_chunk(chunk, request.k),
+                        filter_scores=True,
+                    )
                     continue
                 idx = topk_among_blocks(
                     chunk.scores,

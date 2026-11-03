@@ -12,6 +12,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    finish_prefill_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
@@ -439,8 +440,32 @@ def write_prefill(
     request: RequestScores,
     chunk: ChunkScores,
     idx: torch.Tensor,
+    *,
+    filter_scores: bool = False,
+    candidate_block_size: int = 8,
 ) -> None:
     k, lc = request.k, request.lc
+    if idx.is_cuda and torch.version.hip is None and lc > 0:
+        finish_prefill_indexer_topk(
+            idx,
+            request.slots,
+            chunk.tok,
+            chunk.lens,
+            inputs.out_raw_indices,
+            inputs.out_page_indices,
+            lc,
+            scores=chunk.scores if filter_scores else None,
+            candidate_blocks=chunk.candidate_blocks if filter_scores else None,
+            candidate_block_size=candidate_block_size,
+        )
+        return
+    if filter_scores:
+        selected = idx.long().clamp(0, chunk.scores.shape[1] - 1)
+        valid = (idx >= 0) & (chunk.scores.gather(1, selected) > -torch.inf)
+        if chunk.candidate_blocks is not None:
+            blocks = chunk.candidate_blocks.gather(1, selected // candidate_block_size)
+            idx = blocks * candidate_block_size + selected % candidate_block_size
+        idx = idx.masked_fill(~valid, -1)
     idx = idx.masked_fill(idx < 0, lc).sort(dim=-1).values
     reach = idx < chunk.lens[:, None]
     if inputs.out_page_indices is not None:
