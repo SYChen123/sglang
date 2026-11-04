@@ -156,14 +156,20 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
-    def prefill_cuda_graph_tail_local_buckets(
+    def capture_prefill_tail_buckets_per_rank(
         self, forward_batch: ForwardBatch
     ) -> Optional[tuple[int, ...]]:
         """Optional CP-local tail variants sharing the encoder token bucket."""
         return None
 
-    def prefill_cuda_graph_tail_local_rows(self, forward_batch: ForwardBatch) -> int:
+    def required_prefill_tail_rows_per_rank(self, forward_batch: ForwardBatch) -> int:
         """Largest live CP-local tail needed by this batch, on every rank."""
+        raise NotImplementedError
+
+    def select_prefill_tail_bucket(
+        self, buckets: tuple[int, ...], required_rows_per_rank: int
+    ) -> Optional[int]:
+        """Return a tail bucket that fits within the backend's padding budget."""
         raise NotImplementedError
 
     # Most requests one replay of that captured metadata can carry (None: no

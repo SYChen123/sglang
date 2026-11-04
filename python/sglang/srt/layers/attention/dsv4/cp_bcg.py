@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Capture-stable interleave CP buffers for decoder SWA bounded replay."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import torch
 
 from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
 
+_DENSE_TAIL_WINDOWS = 8
+_TAIL_PADDING_DIVISOR = 4
 
-def cp_tail_local_rows(extend_lens, *, window: int, cp_size: int) -> int:
+
+def required_tail_rows_per_rank(extend_lens, *, window: int, cp_size: int) -> int:
     """Largest rank share of tails in the original interleave order.
 
     Dividing the aggregate by CP misses short tails with the same owner.
@@ -26,21 +31,34 @@ def cp_tail_local_rows(extend_lens, *, window: int, cp_size: int) -> int:
     return max(counts)
 
 
-def cp_tail_local_buckets(
+def capture_tail_buckets_per_rank(
     capacity: int, *, window: int, cp_size: int
 ) -> tuple[int, ...]:
-    """Geometric shapes plus the common three-request prefill shape.
-
-    Retain the capacity ceiling for large batches. Encoder tokens are an
-    independent axis and do not change when selecting a smaller tail.
-    """
+    """Use one-window spacing for small tails and bounded growth after that."""
     step = (window + cp_size - 1) // cp_size
-    buckets = {capacity, min(capacity, 3 * step)}
+    buckets = []
     rows = step
     while rows < capacity:
-        buckets.add(rows)
-        rows *= 2
-    return tuple(sorted(buckets))
+        buckets.append(rows)
+        windows = rows // step
+        rows += step * (
+            1 if windows < _DENSE_TAIL_WINDOWS else windows // _TAIL_PADDING_DIVISOR
+        )
+    buckets.append(capacity)
+    return tuple(buckets)
+
+
+def select_tail_bucket(
+    buckets: tuple[int, ...], required: int, *, window: int, cp_size: int
+) -> int | None:
+    step = (window + cp_size - 1) // cp_size
+    # Allow rounding to the next window for short tails. Large tails have a
+    # relative limit, including when the smallest capture was filtered out.
+    max_padding = max(step - 1, required // _TAIL_PADDING_DIVISOR)
+    return next(
+        (rows for rows in buckets if required <= rows <= required + max_padding),
+        None,
+    )
 
 
 @dataclass

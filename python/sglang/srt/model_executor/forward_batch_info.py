@@ -759,8 +759,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
-    # BCG execution variant; None keeps the backend's ordinary tail geometry.
-    prefill_decoder_tail_local_rows: Optional[int] = None
+    # Padded rows per CP rank in the selected decoder-tail BCG variant.
+    tail_bucket_rows_per_rank: Optional[int] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the

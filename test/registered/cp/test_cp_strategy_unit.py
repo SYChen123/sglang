@@ -132,6 +132,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.max_seq_len = None
         runner.max_num_tokens = 2304
         runner.enable_cp_bcg_capture = True
+        runner._capture_tail_buckets_per_rank = {}
         return runner
 
     def _make_forward_batch(self):
@@ -180,12 +181,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             for cp_rank in range(4):
                 with get_parallel().override(attn_cp_rank=cp_rank, attn_cp_size=4):
                     selected_buckets.append(
-                        runner.prefill_cp_bcg_input.select_replay_bucket_for_batch(
-                            num_tokens=2048,
-                            extend_seq_lens=[1534, 161, 353],
-                            capture_num_tokens=runner.capture_num_tokens,
-                            max_padding_factor=2,
-                        )
+                        runner._select_cp_replay_shape(forward_batch).size
                     )
 
             self.assertEqual(selected_buckets, [2304, 2304, 2304, 2304])
@@ -200,13 +196,16 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             bucket_local_tokens={2048: 512, 2304: 576},
         )
 
-        self.assertIsNone(
-            runner.prefill_cp_bcg_input.select_replay_bucket(
-                num_tokens=1024,
-                required_local_tokens=520,
-                capture_num_tokens=runner.capture_num_tokens,
-                max_padding_factor=2,
-            )
+        self.assertEqual(
+            list(
+                runner.prefill_cp_bcg_input.iter_replay_buckets(
+                    num_tokens=1024,
+                    required_local_tokens=520,
+                    capture_num_tokens=runner.capture_num_tokens,
+                    max_padding_factor=2,
+                )
+            ),
+            [],
         )
 
     def test_bucket_search_falls_back_when_no_capture_has_capacity(self):

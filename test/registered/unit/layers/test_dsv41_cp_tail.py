@@ -45,6 +45,7 @@ class TestDSV41CPTail(CustomTestCase):
         lengths = torch.tensor([2, 3, 1])
         batch = SimpleNamespace(
             batch_size=3,
+            extend_seq_lens_cpu=[2, 17, 1],
             input_ids=ids,
             positions=torch.arange(20),
             forward_mode=ForwardMode.EXTEND,
@@ -58,7 +59,9 @@ class TestDSV41CPTail(CustomTestCase):
         )
         backend = object.__new__(DeepseekV4AttnBackend)
         with patch(f"{BACKEND}.get_parallel", return_value=parallel):
-            layout = backend._late_layer_tail_cp_layout(batch, indices, lengths)
+            layout = backend._late_layer_tail_cp_layout(
+                batch, indices, lengths.tolist()
+            )
         physical = layout["cp_metadata"].per_rank_actual_token[rank]
         chunks = []
         for r in range(cp_size):
@@ -189,6 +192,7 @@ class TestDSV41CPTail(CustomTestCase):
                 full_cp = object()
                 batch = SimpleNamespace(
                     batch_size=3,
+                    extend_seq_lens_cpu=[2, 17, 1],
                     forward_mode=ForwardMode.EXTEND,
                     positions=torch.arange(20),
                     input_ids=torch.arange(20) + 100,
@@ -200,7 +204,7 @@ class TestDSV41CPTail(CustomTestCase):
                 backend = object.__new__(DeepseekV4AttnBackend)
                 with patch(f"{BACKEND}.get_parallel", return_value=parallel):
                     layout = backend._late_layer_tail_cp_layout(
-                        batch, token_indices, lengths
+                        batch, token_indices, lengths.tolist()
                     )
                 meta = layout["cp_metadata"]
                 tail = LateLayerTail(
@@ -346,6 +350,7 @@ class TestDSV41CPTailGraph(CustomTestCase):
             out_cache_loc=torch.arange(64, dtype=torch.int64) + 256,
             req_pool_indices=torch.tensor([2, 3, 4]),
             batch_size=3,
+            extend_seq_lens_cpu=[2, 17, 1],
             forward_mode=ForwardMode.EXTEND,
             attn_cp_metadata=SimpleNamespace(
                 per_rank_actual_token=[64 // cp_size] * cp_size
@@ -356,13 +361,17 @@ class TestDSV41CPTailGraph(CustomTestCase):
         parallel = SimpleNamespace(attn_cp_rank=rank, attn_cp_size=cp_size)
         with patch(f"{BACKEND}.get_parallel", return_value=parallel):
             return DeepseekV4AttnBackend._late_layer_tail_cp_layout(
-                None, batch, indices, lengths, local_capacity=8
+                None, batch, indices, lengths.tolist(), local_capacity=8
             )
 
     def test_changed_layout_reuses_addresses_and_masks_every_padding_row(self):
         cases = [
-            (torch.tensor([0, 1, 16, 17, 18, 19]), torch.tensor([2, 3, 1])),
-            (torch.tensor([8, 9, 10, 11]), torch.tensor([1, 2, 1])),
+            (
+                [2, 17, 1],
+                torch.tensor([0, 1, 16, 17, 18, 19]),
+                torch.tensor([2, 3, 1]),
+            ),
+            ([9, 2, 1], torch.tensor([8, 9, 10, 11]), torch.tensor([1, 2, 1])),
         ]
         for cp_size in (2, 4, 8):
             for rank in range(cp_size):
@@ -373,7 +382,8 @@ class TestDSV41CPTailGraph(CustomTestCase):
                 pointers = {
                     name: value.data_ptr() for name, value in vars(buffers).items()
                 }
-                for indices, lengths in cases:
+                for extend_lens, indices, lengths in cases:
+                    batch.extend_seq_lens_cpu = extend_lens
                     with self.subTest(
                         cp_size=cp_size, rank=rank, indices=indices.tolist()
                     ):
@@ -439,7 +449,7 @@ class TestDSV41CPTailGraph(CustomTestCase):
             parallel = SimpleNamespace(attn_cp_rank=rank, attn_cp_size=4)
             backend = object.__new__(DeepseekV4AttnBackend)
             backend.encoder_replay = False
-            backend._bcg_tail_capacity = 4 * 128
+            backend._bcg_tail_global_capacity = 4 * 128
             backend._bcg_tail_metadata = {}
             backend.req_to_token = torch.arange(4 * 1024).view(4, 1024).to(torch.int32)
             backend.page_size, backend.index_topk = 256, 512
@@ -471,7 +481,7 @@ class TestDSV41CPTailGraph(CustomTestCase):
                 )
                 batch = SimpleNamespace(
                     input_ids=ids,
-                    prefill_decoder_tail_local_rows=local_rows,
+                    tail_bucket_rows_per_rank=local_rows,
                     positions=torch.nn.functional.pad(
                         positions, (0, 288 - len(positions))
                     ),
@@ -638,12 +648,36 @@ class TestDSV41CPTailGraph(CustomTestCase):
 
 
 class TestDSV41CPTailBuckets(CustomTestCase):
+    def test_tail_bucket_policy_covers_small_batches_and_bounds_padding(self):
+        from sglang.srt.layers.attention.dsv4.cp_bcg import (
+            capture_tail_buckets_per_rank,
+            select_tail_bucket,
+        )
+
+        for cp_size in (2, 4, 8):
+            step = 128 // cp_size
+            capacity = 64 * step
+            buckets = capture_tail_buckets_per_rank(
+                capacity, window=128, cp_size=cp_size
+            )
+            self.assertEqual(buckets[:8], tuple(n * step for n in range(1, 9)))
+            self.assertEqual(buckets[-1], capacity)
+            for required in range(1, capacity + 1):
+                selected = select_tail_bucket(
+                    buckets, required, window=128, cp_size=cp_size
+                )
+                self.assertIsNotNone(selected)
+                self.assertLessEqual(selected - required, max(step - 1, required // 4))
+            self.assertIsNone(
+                select_tail_bucket(buckets, capacity + 1, window=128, cp_size=cp_size)
+            )
+
     def test_three_requests_use_96_local_rows_in_the_8192_encoder_bucket(self):
         """BS3 must not inherit the max64 request tail (2048 local rows)."""
         backend = object.__new__(DeepseekV4AttnBackend)
-        backend._bcg_tail_capacity = 8192
+        backend._bcg_tail_global_capacity = 8192
         batch = SimpleNamespace(
-            prefill_decoder_tail_local_rows=96,
+            tail_bucket_rows_per_rank=96,
             attn_cp_metadata=SimpleNamespace(per_rank_actual_token=[2048] * 4),
         )
         with (
@@ -652,18 +686,18 @@ class TestDSV41CPTailBuckets(CustomTestCase):
                 f"{BACKEND}.get_parallel", return_value=SimpleNamespace(attn_cp_size=4)
             ),
         ):
-            self.assertEqual(backend._prefill_graph_tail_block_rows(batch), 384)
+            self.assertEqual(backend._prefill_graph_tail_bucket_global_rows(batch), 384)
 
     def test_cpu_dispatch_covers_short_tails_with_the_same_cp_owner(self):
         from sglang.srt.layers.attention.dsv4.cp_bcg import (
-            cp_tail_local_buckets,
-            cp_tail_local_rows,
+            capture_tail_buckets_per_rank,
+            required_tail_rows_per_rank,
         )
 
         for cp_size in (2, 4, 8):
             # The first case has multiple short tails with the same owner;
             # ceil(aggregate / CP) alone underestimates that rank's rows.
-            for lengths in ([1, 131, 1], [41, 159, 85], [4096] * 3, [1]):
+            for lengths in ([1, 131, 1], [41, 159, 85], [4096] * 3, [3216] * 5, [1]):
                 indices, offset = [], 0
                 for n in lengths:
                     indices.extend(range(offset + n - min(128, n), offset + n))
@@ -672,14 +706,17 @@ class TestDSV41CPTailBuckets(CustomTestCase):
                     sum(i % cp_size == rank for i in indices) for rank in range(cp_size)
                 )
                 self.assertEqual(
-                    cp_tail_local_rows(lengths, window=128, cp_size=cp_size), expected
+                    required_tail_rows_per_rank(lengths, window=128, cp_size=cp_size),
+                    expected,
                 )
                 capacity = 64 * ((128 + cp_size - 1) // cp_size)
-                buckets = cp_tail_local_buckets(capacity, window=128, cp_size=cp_size)
+                buckets = capture_tail_buckets_per_rank(
+                    capacity, window=128, cp_size=cp_size
+                )
                 selected = next(n for n in buckets if n >= expected)
                 self.assertGreaterEqual(selected, expected)
-                if lengths == [4096] * 3:
-                    self.assertEqual(selected, 384 // cp_size)
+                if min(lengths) >= 128:
+                    self.assertEqual(selected, len(lengths) * 128 // cp_size)
 
     def test_attention_reads_only_live_rows_and_zeros_static_bridge_padding(self):
         for tail_rows in ([32, 32, 32], None, []):

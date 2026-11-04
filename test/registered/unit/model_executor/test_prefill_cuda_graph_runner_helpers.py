@@ -570,15 +570,18 @@ class TestPrefillCPTailVariants(CustomTestCase):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
+        from sglang.srt.layers.attention.dsv4.cp_bcg import (
+            capture_tail_buckets_per_rank,
+        )
 
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.enable_cp_bcg_capture = True
         runner._is_full_backend = False
-        runner._decoder_tail_local_variants = {}
+        runner._capture_tail_buckets_per_rank = {}
         runner.prefill_cp_bcg_input = SimpleNamespace(prepare=lambda *a, **kw: None)
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.enable_decoder_swa_bounded_replay = True
-        backend._bcg_tail_capacity = 8192
+        backend._bcg_tail_global_capacity = 8192
 
         def batch(num_tokens):
             return SimpleNamespace(
@@ -596,7 +599,7 @@ class TestPrefillCPTailVariants(CustomTestCase):
         runner._run_forward = lambda fb, n: (
             n,
             len(fb.input_ids),
-            fb.prefill_decoder_tail_local_rows,
+            fb.tail_bucket_rows_per_rank,
         )
         captured = {}
         runner.backend = SimpleNamespace(
@@ -613,26 +616,31 @@ class TestPrefillCPTailVariants(CustomTestCase):
             ),
         ):
             runner.capture_one_shape(8192)
-        expected = (32, 64, 96, 128, 256, 512, 1024, 2048)
-        self.assertEqual(runner._decoder_tail_local_variants, {8192: expected})
+        expected = capture_tail_buckets_per_rank(2048, window=128, cp_size=4)
+        self.assertEqual(runner._capture_tail_buckets_per_rank, {8192: expected})
         self.assertEqual(
-            [key.decoder_tail_local_rows for key in captured], list(reversed(expected))
+            [key.tail_bucket_rows_per_rank for key in captured],
+            list(reversed(expected)),
         )
         for key, output in captured.items():
-            self.assertEqual(output, (8192, 8192, key.decoder_tail_local_rows))
+            self.assertEqual(output, (8192, 8192, key.tail_bucket_rows_per_rank))
 
     def test_encoder_bucket_dispatches_distinct_tail_graphs(self):
         """Changing request count must not replay the previous tail's shape."""
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
-        from sglang.srt.layers.attention.dsv4.cp_bcg import cp_tail_local_buckets
-        from sglang.srt.layers.cp.bcg import execute_prefill_cp_bcg
+        from sglang.srt.layers.attention.dsv4.cp_bcg import (
+            capture_tail_buckets_per_rank,
+        )
+        from sglang.srt.layers.cp.bcg import PrefillCPBCGInput, execute_prefill_cp_bcg
 
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._capture_chunked_prefix = False
-        runner._decoder_tail_local_variants = {
-            8192: cp_tail_local_buckets(2048, window=128, cp_size=4)
+        runner.capture_num_tokens = [4096, 8192]
+        runner._capture_tail_buckets_per_rank = {
+            4096: (128,),
+            8192: capture_tail_buckets_per_rank(2048, window=128, cp_size=4),
         }
         backend = object.__new__(DeepseekV4AttnBackend)
         runner.model_runner = SimpleNamespace(
@@ -643,26 +651,45 @@ class TestPrefillCPTailVariants(CustomTestCase):
                 logits_from_cp_hidden_states=lambda hidden, aux, batch: hidden,
             ),
         )
-        runner.prefill_cp_bcg_input = SimpleNamespace(live_local_tokens=0)
+        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+            input_embeds=torch.empty(0),
+            positions=torch.empty(0),
+            bucket_local_tokens={4096: 1024, 8192: 2048},
+        )
+        runner.prefill_cp_bcg_input.required_local_tokens = lambda lengths: (
+            (sum(lengths) + 3) // 4
+        )
         runner._prefill_forward_context = lambda *a, **kw: nullcontext()
         captured = {}
-        for rows in (32, 96):
-            batch = SimpleNamespace(prefill_decoder_tail_local_rows=rows)
+        for rows in (32, 64, 96, 128, 160, 192):
+            batch = SimpleNamespace(tail_bucket_rows_per_rank=rows)
             captured[runner._shape_key(8192, batch)] = torch.full((rows, 2), rows)
-        self.assertEqual(len(captured), 2)
-        runner.backend = SimpleNamespace(replay=lambda key, batch: captured[key])
+        runner.backend = SimpleNamespace(
+            replay=lambda key, batch: captured[key],
+            can_run=lambda batch, key: key in captured,
+        )
         with patch(
             "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
             return_value=SimpleNamespace(attn_cp_size=4),
         ):
-            for requests in (1, 3, 1):
-                batch = SimpleNamespace(extend_seq_lens_cpu=[2048] * requests)
-                runner._bind_decoder_tail_variant(8192, batch)
+            for requests in (1, 2, 3, 4, 5, 6, 1):
+                extend_lens = [4096 // requests] * requests
+                extend_lens[-1] += 4096 - sum(extend_lens)
+                batch = SimpleNamespace(
+                    input_ids=range(4096), extend_seq_lens_cpu=extend_lens
+                )
+                shape = runner._select_cp_replay_shape(batch)
+                self.assertIsNotNone(shape)
+                self.assertEqual(shape.size, 8192)
+                self.assertEqual(shape.tail_bucket_rows_per_rank, 32 * requests)
                 output = execute_prefill_cp_bcg(
-                    runner, batch, batch, 8192, 2048 * requests
+                    runner, batch, batch, shape.size, 4096, shape
                 )
                 self.assertEqual(output.shape, (32 * requests, 2))
                 self.assertTrue((output == 32 * requests).all())
+            # The only remaining encoder bucket overpads a single-request tail.
+            runner.capture_num_tokens = [4096]
+            self.assertIsNone(runner._select_cp_replay_shape(batch))
 
 
 if __name__ == "__main__":

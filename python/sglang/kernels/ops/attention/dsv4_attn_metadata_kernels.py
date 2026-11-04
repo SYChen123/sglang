@@ -452,8 +452,12 @@ def late_layer_tail_layout(
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
         floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
-    # One H2D copy for the three length vectors; launch count does not grow with bs.
-    lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
+    # Keep replay preparation from waiting for earlier work on the current stream.
+    # The three length vectors share one pinned H2D copy.
+    pin = device.type == "cuda"
+    lens = torch.tensor(
+        [extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device="cpu", pin_memory=pin
+    ).to(device, non_blocking=pin)
     extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]
     total = sum(tail_lens_cpu)
     req = torch.repeat_interleave(

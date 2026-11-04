@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
         PrefillCudaGraphRunner,
     )
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
     from sglang.srt.server_args import ServerArgs
 
 
@@ -164,15 +166,15 @@ class PrefillCPBCGInput:
         align_size = get_cp_padding_align_size()
         return (max_local_tokens + align_size - 1) // align_size * align_size
 
-    def select_replay_bucket(
+    def iter_replay_buckets(
         self,
         *,
         num_tokens: int,
         required_local_tokens: int,
         capture_num_tokens: list[int],
         max_padding_factor: int,
-    ) -> Optional[int]:
-        """Return the smallest global capture whose CP-local rows fit."""
+    ) -> Iterator[int]:
+        """Yield global captures whose CP-local rows fit, smallest first."""
         max_num_tokens = num_tokens * max_padding_factor
         for bucket in capture_num_tokens:
             if bucket < num_tokens:
@@ -184,26 +186,7 @@ class PrefillCPBCGInput:
                 captured_local_tokens is not None
                 and required_local_tokens <= captured_local_tokens
             ):
-                return bucket
-        return None
-
-    def select_replay_bucket_for_batch(
-        self,
-        *,
-        num_tokens: int,
-        extend_seq_lens: Any,
-        capture_num_tokens: list[int],
-        max_padding_factor: int,
-    ) -> Optional[int]:
-        required_local_tokens = self.required_local_tokens(extend_seq_lens)
-        if required_local_tokens is None:
-            return None
-        return self.select_replay_bucket(
-            num_tokens=num_tokens,
-            required_local_tokens=required_local_tokens,
-            capture_num_tokens=capture_num_tokens,
-            max_padding_factor=max_padding_factor,
-        )
+                yield bucket
 
     def prepare(
         self,
@@ -343,15 +326,10 @@ def execute_prefill_cp_bcg(
     static_forward_batch: ForwardBatch,
     static_num_tokens: int,
     raw_num_tokens: int,
+    shape_key: ShapeKey,
     **kwargs,
 ):
     """Replay a CP-local body and run the global gather/logits tail eagerly."""
-    # Importing a runner submodule while server arguments are being resolved
-    # executes runner/__init__.py, which imports this module through the prefill
-    # runner. Defer the runtime-only dependency until runner initialization has
-    # completed to keep the server-argument compatibility check acyclic.
-    from sglang.srt.model_executor.runner.shape_key import ShapeKey
-
     cp_input = runner.prefill_cp_bcg_input
     assert cp_input is not None
     model = runner.model_runner.model
@@ -360,16 +338,7 @@ def execute_prefill_cp_bcg(
         num_tokens=static_num_tokens,
         raw_num_tokens=raw_num_tokens,
     ):
-        local_output = runner.backend.replay(
-            ShapeKey(
-                size=static_num_tokens,
-                decoder_tail_local_rows=getattr(
-                    static_forward_batch, "prefill_decoder_tail_local_rows", None
-                ),
-            ),
-            static_forward_batch,
-            **kwargs,
-        )
+        local_output = runner.backend.replay(shape_key, static_forward_batch, **kwargs)
         cp_logits = getattr(model, "logits_from_cp_hidden_states", None)
         if cp_logits is None:
             local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)

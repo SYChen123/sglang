@@ -494,7 +494,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
-        self._decoder_tail_local_variants: Dict[int, tuple[int, ...]] = {}
+        self._capture_tail_buckets_per_rank: Dict[int, tuple[int, ...]] = {}
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -1084,23 +1084,46 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return ShapeKey(
             size=num_tokens,
             variant_label=variant,
-            decoder_tail_local_rows=getattr(
-                forward_batch, "prefill_decoder_tail_local_rows", None
+            tail_bucket_rows_per_rank=getattr(
+                forward_batch, "tail_bucket_rows_per_rank", None
             ),
         )
 
-    def _bind_decoder_tail_variant(
-        self, num_tokens: int, forward_batch: ForwardBatch
-    ) -> None:
-        variants = self._decoder_tail_local_variants.get(num_tokens)
-        if variants is None:
-            return
-        needed = self.model_runner.attn_backend.prefill_cuda_graph_tail_local_rows(
+    def _select_cp_replay_shape(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[ShapeKey]:
+        """Pick a captured encoder and tail pair before touching replay buffers."""
+        cp_input = self.prefill_cp_bcg_input
+        assert cp_input is not None
+        required_encoder_rows = cp_input.required_local_tokens(
+            forward_batch.extend_seq_lens_cpu
+        )
+        if required_encoder_rows is None:
+            return None
+        encoder_buckets = cp_input.iter_replay_buckets(
+            num_tokens=len(forward_batch.input_ids),
+            required_local_tokens=required_encoder_rows,
+            capture_num_tokens=self.capture_num_tokens,
+            max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+        )
+        if not self._capture_tail_buckets_per_rank:
+            size = next(encoder_buckets, None)
+            return ShapeKey(size=size) if size is not None else None
+
+        attn_backend = self.model_runner.attn_backend
+        required_tail_rows = attn_backend.required_prefill_tail_rows_per_rank(
             forward_batch
         )
-        forward_batch.prefill_decoder_tail_local_rows = next(
-            rows for rows in variants if rows >= needed
-        )
+        for size in encoder_buckets:
+            tail_rows = attn_backend.select_prefill_tail_bucket(
+                self._capture_tail_buckets_per_rank.get(size, ()), required_tail_rows
+            )
+            if tail_rows is None:
+                continue
+            shape_key = ShapeKey(size=size, tail_bucket_rows_per_rank=tail_rows)
+            if self.backend.can_run(forward_batch, shape_key):
+                return shape_key
+        return None
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
@@ -1461,20 +1484,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             batch_max_context_len=batch_max_context_len,
         ):
             return False
-        if getattr(self, "enable_cp_bcg_capture", False):
-            if not is_cp_active(forward_batch):
-                return False
-            assert self.prefill_cp_bcg_input is not None
-            if (
-                self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
-                    num_tokens=len(forward_batch.input_ids),
-                    extend_seq_lens=forward_batch.extend_seq_lens_cpu,
-                    capture_num_tokens=self.capture_num_tokens,
-                    max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
-                )
-                is None
-            ):
-                return False
+        if (
+            getattr(self, "enable_cp_bcg_capture", False)
+            and self._select_cp_replay_shape(forward_batch) is None
+        ):
+            return False
         backend_can_run = self._backend_can_run_prefill_cuda_graph
         if backend_can_run is not None and not backend_can_run(forward_batch):
             return False
@@ -1728,7 +1742,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         size: int,
         *,
         prefix_num_chunks: int = 0,
-        decoder_tail_local_rows: Optional[int] = None,
+        tail_bucket_rows_per_rank: Optional[int] = None,
     ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
@@ -1743,22 +1757,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 static_num_tokens=num_tokens,
                 capture=True,
             )
-            if decoder_tail_local_rows is None:
-                variants = attn_backend.prefill_cuda_graph_tail_local_buckets(
+            if tail_bucket_rows_per_rank is None:
+                variants = attn_backend.capture_prefill_tail_buckets_per_rank(
                     forward_batch
                 )
                 if variants is not None:
-                    self._decoder_tail_local_variants[num_tokens] = variants
+                    assert variants, "Capture batch exceeds the CP tail capacity"
+                    self._capture_tail_buckets_per_rank[num_tokens] = variants
                     # Largest first: output/workspace capacity is established
                     # before capturing smaller decoder shapes of the same body.
                     for local_rows in reversed(variants):
                         self.capture_one_shape(
                             size,
                             prefix_num_chunks=prefix_num_chunks,
-                            decoder_tail_local_rows=local_rows,
+                            tail_bucket_rows_per_rank=local_rows,
                         )
                     return
-        forward_batch.prefill_decoder_tail_local_rows = decoder_tail_local_rows
+        forward_batch.tail_bucket_rows_per_rank = tail_bucket_rows_per_rank
         if forward_batch.lora_ids is not None:
             # Fill the static prefill LoRA batch info the captured kernels
             # will read (all-None ids: ranks stay 0, kernels no-op).
@@ -1771,7 +1786,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             lora_manager.prepare_lora_batch(forward_batch)
         shape_key = ShapeKey(
             size=num_tokens,
-            decoder_tail_local_rows=decoder_tail_local_rows,
+            tail_bucket_rows_per_rank=tail_bucket_rows_per_rank,
             variant_label=(
                 _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
@@ -1846,23 +1861,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         the model code reads during replay.
         """
         num_tokens = len(forward_batch.input_ids)
-        static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        cp_shape = None
         if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
             forward_batch
         ):
-            assert self.prefill_cp_bcg_input is not None
-            static_num_tokens = (
-                self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
-                    num_tokens=num_tokens,
-                    extend_seq_lens=forward_batch.extend_seq_lens_cpu,
-                    capture_num_tokens=self.capture_num_tokens,
-                    max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
-                )
-            )
-            if static_num_tokens is None:
+            cp_shape = self._select_cp_replay_shape(forward_batch)
+            if cp_shape is None:
                 raise RuntimeError(
                     "Prefill CUDA graph replay was admitted without a fitting bucket"
                 )
+            static_num_tokens = cp_shape.size
+        else:
+            static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         self.raw_num_tokens = num_tokens
 
         if self.max_context_size is not None:
@@ -2107,18 +2117,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         metadata_forward_batch = forward_batch
-        if self.enable_cp_bcg_capture:
+        if cp_shape is not None:
             assert self.prefill_cp_bcg_input is not None
+            static_forward_batch.tail_bucket_rows_per_rank = (
+                cp_shape.tail_bucket_rows_per_rank
+            )
             self.prefill_cp_bcg_input.prepare(
                 self,
                 static_forward_batch,
                 static_num_tokens=static_num_tokens,
                 capture=False,
             )
-            self._bind_decoder_tail_variant(static_num_tokens, static_forward_batch)
             metadata_forward_batch = static_forward_batch
 
-        shape_key = self._shape_key(static_num_tokens, metadata_forward_batch)
+        shape_key = cp_shape or self._shape_key(
+            static_num_tokens, metadata_forward_batch
+        )
         self._prepare_forward_metadata_for_replay(
             metadata_forward_batch, static_forward_batch, shape_key
         )
@@ -2342,6 +2356,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     static_forward_batch,
                     static_num_tokens,
                     raw_num_tokens,
+                    shape_key,
                     **kwargs,
                 )
             elif self._uses_eager_prefill_tail():
