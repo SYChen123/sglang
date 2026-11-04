@@ -1041,7 +1041,14 @@ class DeepseekV2MoE(nn.Module):
                 )
         else:
             return self.forward_deepep(
-                hidden_states, forward_batch, input_ids_global=input_ids_global
+                hidden_states,
+                forward_batch,
+                input_ids_global=input_ids_global,
+                use_vision_topk=(
+                    use_vision_topk
+                    and not self.is_hash
+                    and get_moe_a2a_backend().is_deepep()
+                ),
             )
 
     def forward_normal_dual_stream(
@@ -1466,6 +1473,8 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: Optional[torch.Tensor] = None,
+        *,
+        use_vision_topk: bool = False,
     ) -> torch.Tensor:
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
@@ -1495,24 +1504,33 @@ class DeepseekV2MoE(nn.Module):
                         torch.cuda.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
+            num_token_non_padded = forward_batch.moe_num_token_non_padded()
+            dispatch_info = (
+                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                if not self.is_nextn
+                else None
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    )
-                    if not self.is_nextn
-                    else None
-                ),
-                **topk_kwargs,
-            )
+            if use_vision_topk:
+                topk_output = vision_topk(
+                    self,
+                    router_logits,
+                    input_ids_global,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                )
+            else:
+                topk_kwargs = (
+                    {"input_ids": input_ids_global}
+                    if getattr(self, "is_hash", False)
+                    else {}
+                )
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
         else:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id

@@ -4369,6 +4369,9 @@ class DeepseekV4Model(nn.Module):
             or not get_moe_a2a_backend().is_none()
             or get_parallel().attn_dp_size > 1
         )
+        # The split MoE ops do not carry the remapped image token IDs.
+        if self.late_layer_vl_routing and get_moe_a2a_backend().is_deepep():
+            return False
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
@@ -4685,13 +4688,23 @@ class DeepseekV4ForCausalLM(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         ):
+            moe_a2a_backend = get_moe_a2a_backend()
             if get_parallel().pp_group.world_size != 1 or not (
-                get_moe_a2a_backend().is_none()
-                or (_is_cuda and get_moe_a2a_backend().is_megamoe())
+                moe_a2a_backend.is_none()
+                or (
+                    _is_cuda
+                    and (
+                        moe_a2a_backend.is_megamoe()
+                        or (
+                            moe_a2a_backend.is_deepep()
+                            and get_parallel().attn_cp_size > 1
+                        )
+                    )
+                )
             ):
                 raise ValueError(
                     "V4.1 vision supports TP/EP/DP/CP without PP; "
-                    "MoE A2A requires CUDA MegaMoE"
+                    "MoE A2A requires CUDA MegaMoE or CUDA DeepEP with prefill CP"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
