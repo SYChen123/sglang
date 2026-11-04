@@ -1,17 +1,19 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
 
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.layers.moe import MoeA2ABackend
+from sglang.srt.layers.moe import topk as topk_module
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKConfig
 from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
     is_shared_experts_fusion_disabled,
 )
-from sglang.srt.models import deepseek_v4
+from sglang.srt.models import deepseek_v2, deepseek_v4
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.models.deepseek_v4_dspark import (
     DeepseekV4ForCausalLMDSpark,
@@ -114,11 +116,8 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         self.assertTrue(is_shared_experts_fusion_disabled())
         self.assertFalse(get_exec().moe.disable_shared_experts_fusion)
 
-    def test_v41_vision_admits_cuda_megamoe_with_dp_attention(self):
-        """A vision-capable checkpoint must initialize for text or image serving
-        with DP attention and CUDA MegaMoE. CP, PP and other A2A paths still lack
-        vision routing support and must fail before constructing the tower.
-        """
+    def test_v41_vision_admits_cuda_megamoe_and_prefill_cp_deepep(self):
+        """A vision checkpoint can build with CUDA DeepEP when prefill uses CP."""
         config = DeepSeekV4Config(
             architectures=["DeepseekV4ForCausalLM"],
             model_type="deepseek_v41",
@@ -142,16 +141,20 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
             (MoeA2ABackend.NONE, True, 1, 1, True),
             (MoeA2ABackend.MEGAMOE, False, 1, 1, False),
             (MoeA2ABackend.DEEPEP, True, 1, 1, False),
-            (MoeA2ABackend.MEGAMOE, True, 2, 1, False),
+            (MoeA2ABackend.DEEPEP, True, 4, 1, True),
+            (MoeA2ABackend.DEEPEP, False, 4, 1, False),
+            (MoeA2ABackend.DEEPEP, True, 4, 2, False),
+            (MoeA2ABackend.MEGAMOE, True, 2, 1, True),
             (MoeA2ABackend.MEGAMOE, True, 1, 2, False),
         )
         for backend, cuda, cp, pp, admitted in cases:
+            dp = min(2, 4 // cp)
             with self.subTest(backend=backend, cuda=cuda, cp=cp, pp=pp):
                 with (
                     get_parallel().override(
                         tp_size=4,
-                        attn_dp_size=2,
-                        attn_tp_size=2 // cp,
+                        attn_dp_size=dp,
+                        attn_tp_size=4 // (dp * cp),
                         attn_cp_size=cp,
                         moe_ep_size=4,
                         pp_group=SimpleNamespace(world_size=pp, is_last_rank=True),
@@ -175,6 +178,62 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
                     else:
                         with self.assertRaisesRegex(ValueError, "V4.1 vision"):
                             DeepseekV4ForCausalLM(config)
+
+    def test_v41_deepep_dispatches_image_and_text_to_different_experts(self):
+        """Image rows use their bias before A2A, and padded rows dispatch nothing."""
+        moe = deepseek_v2.DeepseekV2MoE.__new__(deepseek_v2.DeepseekV2MoE)
+        nn.Module.__init__(moe)
+        moe.config = SimpleNamespace(image_token_id=99)
+        moe.is_hash = moe.is_nextn = moe._fuse_shared_experts_inside_sbo = False
+        moe._enable_a2a_moe = True
+        moe.layer_id, moe.num_fused_shared_experts, moe.alt_stream = 0, 1, None
+        logits = torch.zeros(3, 2)
+        moe.gate = Mock(
+            return_value=logits,
+            e_score_correction_bias=torch.tensor([1.0, 0.0]),
+            e_score_correction_bias_vl=torch.tensor([0.0, 1.0]),
+        )
+        moe.topk = Mock(
+            topk_config=TopKConfig(
+                top_k=2,
+                num_fused_shared_experts=1,
+                routed_scaling_factor=2.0,
+                apply_routed_scaling_factor_on_output=True,
+            ),
+            return_value=StandardTopKOutput(
+                torch.tensor([[2.0, 1.0], [2.0, 1.0], [0.0, 0.0]]),
+                torch.tensor([[0, 3], [0, 3], [-1, -1]], dtype=torch.int32),
+                logits,
+            ),
+        )
+        dispatched = []
+
+        def run_experts(hidden_states, topk_output):
+            dispatched.append(topk_output)
+            return hidden_states
+
+        moe.experts = Mock(
+            side_effect=run_experts, should_fuse_routed_scaling_factor_in_topk=True
+        )
+        batch = SimpleNamespace(moe_num_token_non_padded=lambda: torch.tensor(2))
+        with (
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.DEEPEP),
+            get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
+            patch.object(
+                deepseek_v2.ExpertLocationDispatchInfo, "init_new", return_value=None
+            ),
+            patch("sglang.srt.multimodal.dsv41.vl_routing.is_cuda", return_value=False),
+            patch.object(topk_module, "_is_cuda", False),
+            patch.object(topk_module, "_can_fuse_padded_region", return_value=False),
+        ):
+            moe(torch.ones(3, 4), batch, input_ids_global=torch.tensor([7, 99, 99]))
+        output = dispatched[0]
+        torch.testing.assert_close(
+            output.topk_ids, torch.tensor([[0, 3], [2, 3], [-1, -1]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            output.topk_weights, torch.tensor([[2.0, 1.0], [2.0, 1.0], [0.0, 0.0]])
+        )
 
     def test_enables_shared_fusion_when_enforced(self):
         self._publish(enforce=True)

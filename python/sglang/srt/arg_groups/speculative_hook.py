@@ -637,12 +637,26 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                     "DSpark TP LM-head all-to-all currently requires a "
                     "DeepSeek-V4 target and its bundled MoE draft."
                 )
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        if not _is_npu and cfg.moe_a2a_backend not in (
+            "none",
+            "megamoe",
+            "mori",
+            "deepep",
+        ):
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE), 'megamoe', or 'mori', got "
+                "(built-in TP MoE), 'megamoe', 'mori', or 'deepep', got "
                 f"{cfg.moe_a2a_backend!r}."
             )
+        if not _is_npu and cfg.moe_a2a_backend == "deepep":
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            if not cfg.device.startswith("cuda") or not is_deepseek_v4(
+                model_config_of(server_args).hf_config
+            ):
+                raise ValueError(
+                    "DSpark with DeepEP and dp attention requires a CUDA DeepSeek-V4 target."
+                )
         if not _is_npu and (
             cfg.moe_a2a_backend != "none"
             or envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
