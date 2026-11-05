@@ -3745,7 +3745,18 @@ class DeepseekV4AttnBackend(
                 is_source = is_consumer = False
 
             inputs = self._make_low_ratio_decode_indexer_inputs(
-                layer, x, q_lora, req, pos, mode, query_rows=query_rows
+                layer,
+                x,
+                q_lora,
+                req,
+                pos,
+                mode,
+                query_rows=query_rows,
+                verify_tokens_per_request=(
+                    forward_batch.spec_info.draft_token_num
+                    if mode.is_target_verify()
+                    else None
+                ),
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
@@ -3794,7 +3805,16 @@ class DeepseekV4AttnBackend(
         self.full_topk_indexer.topk_prefill_captured(inputs)
 
     def _make_low_ratio_decode_indexer_inputs(
-        self, layer, x, q_lora, req, pos, mode, *, query_rows=None
+        self,
+        layer,
+        x,
+        q_lora,
+        req,
+        pos,
+        mode,
+        *,
+        query_rows=None,
+        verify_tokens_per_request=None,
     ):
         ratio = layer.compress_ratio
         metadata = (
@@ -3803,6 +3823,17 @@ class DeepseekV4AttnBackend(
             else self.forward_metadata.c2_indexer_metadata
         )
         assert metadata is not None, f"no decode indexer metadata for {ratio = }"
+        # Verify rows are request-major. A CP query slice can start in the
+        # middle of a request, so only even starts preserve the original pairs.
+        is_verify = mode.is_target_verify()
+        row_start = query_rows.start if query_rows is not None else 0
+        verify_width = (verify_tokens_per_request or 0) if is_verify else 0
+        k_reuse_group_size = 1
+        if verify_width > 1:
+            if row_start % verify_width == 0 and req.shape[0] % verify_width == 0:
+                k_reuse_group_size = -1
+            elif verify_width % 2 == 0 and row_start % 2 == 0:
+                k_reuse_group_size = 2
         output = self.forward_metadata.core_metadata.sparse_page_indices(ratio)
         if query_rows is not None:
             # Do not run PagedIndexerMetadata.__post_init__: SM90's DeepSelect
@@ -3821,8 +3852,10 @@ class DeepseekV4AttnBackend(
             positions=pos,
             req_rows=req,
             paged_metadata=metadata,
-            is_verify=mode.is_target_verify(),
+            is_verify=is_verify,
             out_page_indices=output,
+            k_reuse_group_size=k_reuse_group_size,
+            verify_tokens_per_request=verify_width,
         )
 
     def _make_low_ratio_prefill_indexer_inputs(

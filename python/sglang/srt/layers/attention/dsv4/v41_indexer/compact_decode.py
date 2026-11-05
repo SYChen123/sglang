@@ -103,8 +103,20 @@ def compact_decode(
     rows_per_chunk = _score_rows_per_chunk(
         width, block_size=block_size if published is None else None
     )
+    use_fp8 = envs.SGLANG_OPT_DSV41_DECODE_INDEXER_FP8.get()
+    k_reuse_group_size = (
+        inputs.k_reuse_group_size if published is None and use_fp8 else 1
+    )
+    if k_reuse_group_size == -1 and bs > rows_per_chunk:
+        # Keep request reuse if the existing chunks preserve complete requests.
+        verify_width = inputs.verify_tokens_per_request
+        if rows_per_chunk % verify_width:
+            k_reuse_group_size = 2 if verify_width % 2 == 0 else 1
+    if k_reuse_group_size == 2 and rows_per_chunk > 1:
+        rows_per_chunk -= rows_per_chunk % 2
+    single_chunk = bs <= rows_per_chunk
     source_blocks = source_counts = None
-    if published is None:
+    if published is None and not single_chunk:
         source_blocks = torch.empty(
             (bs, topk_blocks), dtype=torch.int32, device=pos.device
         )
@@ -126,20 +138,25 @@ def compact_decode(
             candidate_blocks=blocks[rows] if blocks is not None else None,
             candidate_block_size=block_size,
             return_block_scores=published is None,
-            use_fp8=envs.SGLANG_OPT_DSV41_DECODE_INDEXER_FP8.get(),
+            use_fp8=use_fp8,
+            k_reuse_group_size=k_reuse_group_size,
+            verify_tokens_per_request=inputs.verify_tokens_per_request,
         )
         if published is None:
             scores, block_scores = scores
             selected_blocks, counts = candidate_block_state(
                 block_scores, lengths, topk_blocks=topk_blocks, block_size=block_size
             )
-            source_blocks[rows] = selected_blocks
-            source_counts[rows] = counts
+            if single_chunk:
+                source_blocks, source_counts = selected_blocks, counts
+            else:
+                source_blocks[rows] = selected_blocks
+                source_counts[rows] = counts
             del block_scores, selected_blocks, counts
         selected = torch.empty(
             (q[rows].shape[0], k), dtype=torch.int32, device=q.device
         )
-        plan = shared_plan if bs <= rows_per_chunk else None
+        plan = shared_plan if single_chunk else None
         if plan is None:
             plan = plan_topk_v2(lengths)
         topk_transform_paged_v2(scores, lengths, None, selected, 1, plan)

@@ -557,6 +557,8 @@ def decode_scores(
             ratio,
             candidate_mask,
             use_fp8=envs.SGLANG_OPT_DSV41_DECODE_INDEXER_FP8.get(),
+            k_reuse_group_size=inputs.k_reuse_group_size,
+            verify_tokens_per_request=inputs.verify_tokens_per_request,
         )
         return PagedDecodeScores(
             bs=bs,

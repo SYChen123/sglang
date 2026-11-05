@@ -84,6 +84,9 @@ class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
 
     # [rows, topk] int32 index-K pool slots of the selection, unordered, -1 padded.
     out_page_indices: torch.Tensor
+    # One row, same-request pairs, or complete request-major groups (-1).
+    k_reuse_group_size: int = 1
+    verify_tokens_per_request: int = 0
 
     def reset_outputs(self) -> None:
         self.out_page_indices.fill_(-1)
