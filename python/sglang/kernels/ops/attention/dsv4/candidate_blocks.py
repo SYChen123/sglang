@@ -16,6 +16,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .topk import plan_topk_v2, topk_transform_paged_v2
@@ -306,6 +307,7 @@ def select_candidate_block_ids(
         and block_size == 8
         and 0 < width <= 131072
         and (width <= 32768 or topk_blocks == 2048)
+        and envs.SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION.get()
         and (
             isinstance(compress_lens, int)
             or (

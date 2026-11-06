@@ -38,8 +38,13 @@ def _score_rows_per_chunk(width: int, *, block_size: int | None) -> int:
         row_bytes += (blocks * 4 + 15) // 16 * 16
     # Leave room for selection indices, sorting and TopK plans. The old 8 bytes
     # per score substantially overestimated these per-chunk allocations.
-    reserve = min(8 << 20, _SCORE_BUDGET_BYTES // 16)
-    return max(1, (_SCORE_BUDGET_BYTES - reserve) // max(1, row_bytes))
+    score_budget_bytes = (
+        _SCORE_BUDGET_BYTES
+        if envs.SGLANG_OPT_DSV41_LARGE_INDEXER_SCORE_BUDGET.get()
+        else 128 << 20
+    )
+    reserve = min(8 << 20, score_budget_bytes // 16)
+    return max(1, (score_budget_bytes - reserve) // max(1, row_bytes))
 
 
 class CompactDecodeBlocks(CandidateMetadata, msgspec.Struct):

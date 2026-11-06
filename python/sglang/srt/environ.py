@@ -1641,6 +1641,10 @@ class Envs:
     # In auto mode, select DG by the actual rank-local query rows in a score
     # chunk, after applying the score-buffer budget (not request/context size).
     SGLANG_DSV41_SM90_PREFILL_INDEXER_DEEPGEMM_MIN_ROWS = EnvInt(128)
+    # H20 ablations for the scorer budget, prefill selection, and verify K tiles.
+    SGLANG_OPT_DSV41_LARGE_INDEXER_SCORE_BUDGET = EnvBool(True)
+    SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION = EnvBool(True)
+    SGLANG_OPT_DSV41_VERIFY_INDEXER_K_REUSE = EnvBool(True)
     # Hopper decode/verify: fuse FP4 K unpacking with an FP8 dot, retaining
     # BF16 post-dot rounds and a BF16 fallback for out-of-range inputs.
     SGLANG_OPT_DSV41_DECODE_INDEXER_FP8 = EnvBool(False)

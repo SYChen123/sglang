@@ -16,10 +16,6 @@ from sglang.srt.runtime_context import get_platform
 if TYPE_CHECKING:
     from .types import PrefillInputs
 
-# Only the final [query, key] FP32 scores are materialized. Leave headroom for
-# candidate selection and top-k scratch; this does not change model prefill size.
-_SCORE_BUDGET_BYTES = 2048 << 20
-
 
 def use_sm90_prefill(inputs: PrefillInputs) -> bool:
     return (
@@ -65,6 +61,10 @@ def prefill_requests(
             deepgemm_fp8_index_logits_prefill,
         )
 
+    # Only the final [query, key] FP32 scores are materialized.
+    score_budget_bytes = (
+        2048 if envs.SGLANG_OPT_DSV41_LARGE_INDEXER_SCORE_BUDGET.get() else 64
+    ) << 20
     inputs.reset_outputs()
     counts, seq_lens = inputs.rows_per_request, inputs.seq_lens_cpu
     assert len(counts) == len(seq_lens) == inputs.req_pool_indices.numel()
@@ -114,7 +114,7 @@ def prefill_requests(
             row_alignment = 128 // q.shape[1] if backend != "triton" else 1
             rows_per_chunk = max(
                 row_alignment,
-                (_SCORE_BUDGET_BYTES // (stride * 4)) // row_alignment * row_alignment,
+                (score_budget_bytes // (stride * 4)) // row_alignment * row_alignment,
             )
             key_scales = None
             for start in range(0, request.tok.numel(), rows_per_chunk):

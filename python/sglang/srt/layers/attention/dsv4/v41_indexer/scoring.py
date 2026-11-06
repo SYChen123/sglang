@@ -445,7 +445,12 @@ def write_prefill(
     candidate_block_size: int = 8,
 ) -> None:
     k, lc = request.k, request.lc
-    if idx.is_cuda and torch.version.hip is None and lc > 0:
+    if (
+        idx.is_cuda
+        and torch.version.hip is None
+        and lc > 0
+        and envs.SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION.get()
+    ):
         finish_prefill_indexer_topk(
             idx,
             request.slots,
