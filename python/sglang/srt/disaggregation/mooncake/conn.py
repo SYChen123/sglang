@@ -269,7 +269,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Set by teardown() to make worker threads exit (P<->D role switch).
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
+        self._transfer_completion_condition = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0:
+                self._transfer_completion_condition = threading.Condition()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             # Separate from failed_sessions, which _run_one_probe_pass clears
@@ -349,6 +352,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_allocator()
             self.start_decode_thread()
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        super().update_status(bootstrap_room, status)
+        condition = getattr(self, "_transfer_completion_condition", None)
+        if condition is not None and status in (KVPoll.Success, KVPoll.Failed):
+            with condition:
+                condition.notify_all()
+
+    def wait_for_transfer_rooms(self, rooms: Set[int], timeout_s: float) -> None:
+        condition = self._transfer_completion_condition
+        if condition is not None and rooms:
+            with condition:
+                condition.wait_for(
+                    lambda: all(
+                        self.request_status.get(room)
+                        in (None, KVPoll.Success, KVPoll.Failed)
+                        for room in rooms
+                    ),
+                    timeout=timeout_s,
+                )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -1162,9 +1185,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
-        if (
-            self.enable_custom_mem_pool
-            and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
+        if self.enable_custom_mem_pool and (
+            self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
+            or not envs.SGLANG_OPT_MOONCAKE_NVLINK_LAYER_BATCH.get()
         ):
             futures = [
                 executor.submit(

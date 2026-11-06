@@ -1117,6 +1117,14 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
+        if rids_to_check is None:
+            final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
+            if final_rooms:
+                timeout_s = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() / 1000.0
+                manager = self.disagg_prefill_bootstrap_queue.kv_manager
+                manager.wait_for_transfer_rooms(final_rooms, timeout_s)
+                final_rooms.clear()
+
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
             self.attn_cp_cpu_group,
@@ -1675,6 +1683,18 @@ class SchedulerDisaggregationPrefillMixin:
                 send_state_indices,
                 num_kv_tokens=seg_end - seg_start,
             )
+            if (
+                segment_is_last
+                and self.pp_size == 1
+                and envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
+                and hasattr(
+                    self.disagg_prefill_bootstrap_queue.kv_manager,
+                    "wait_for_transfer_rooms",
+                )
+            ):
+                if not hasattr(self, "_disagg_final_chunk_rooms"):
+                    self._disagg_final_chunk_rooms = set()
+                self._disagg_final_chunk_rooms.add(req.bootstrap_room)
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.

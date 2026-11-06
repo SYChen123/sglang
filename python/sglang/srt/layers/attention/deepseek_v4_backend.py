@@ -3829,7 +3829,11 @@ class DeepseekV4AttnBackend(
         row_start = query_rows.start if query_rows is not None else 0
         verify_width = (verify_tokens_per_request or 0) if is_verify else 0
         k_reuse_group_size = 1
-        if verify_width > 1 and envs.SGLANG_OPT_DSV41_VERIFY_INDEXER_K_REUSE.get():
+        reuse_k = envs.SGLANG_OPT_DSV41_VERIFY_INDEXER_K_REUSE.get() and (
+            envs.SGLANG_OPT_DSV41_DECODE_INDEXER_FP8.get()
+            or envs.SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE.get()
+        )
+        if verify_width > 1 and reuse_k:
             if row_start % verify_width == 0 and req.shape[0] % verify_width == 0:
                 k_reuse_group_size = -1
             elif verify_width % 2 == 0 and row_start % 2 == 0:

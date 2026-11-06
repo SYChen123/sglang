@@ -927,6 +927,25 @@ def _reduce_index_logits(
 
 
 @triton.jit
+def _expand_bf16_index_keys(pay, exps):
+    scale = tl.exp2(exps.to(tl.float32) - 127.0)
+    return (
+        (_e2m1_decode(pay & 0x0F) * scale).to(tl.bfloat16),
+        (_e2m1_decode((pay >> 4) & 0x0F) * scale).to(tl.bfloat16),
+    )
+
+
+@triton.jit
+def _bf16_index_dot(q, row, stride_qb, stride_qh, k_low, k_high, H: tl.constexpr):
+    heads = tl.arange(0, H)
+    pairs = tl.arange(0, k_low.shape[1])
+    offsets = row * stride_qb + heads[:, None] * stride_qh + 2 * pairs[None, :]
+    q_even = tl.load(q + offsets)
+    q_odd = tl.load(q + offsets + 1)
+    return tl.dot(q_even, tl.trans(k_low)) + tl.dot(q_odd, tl.trans(k_high))
+
+
+@triton.jit
 def _fp4_index_logits_tile(
     q_ptr,
     w_ptr,
@@ -1343,7 +1362,7 @@ def _score_paired_fp8_tile(
 
 
 @triton.jit
-def _fp8_index_logits_grouped_kernel(
+def _fp4_index_logits_grouped_kernel(
     q,
     weights,
     req_rows,
@@ -1368,10 +1387,11 @@ def _fp8_index_logits_grouped_kernel(
     WRITE_BLOCK_SCORES: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     GROUP_LANES: tl.constexpr,
+    USE_FP8: tl.constexpr,
 ):
     start = tl.program_id(0) * GROUP_SIZE
     request = tl.load(req_rows + start).to(tl.int64)
-    if GROUP_SIZE == 2:
+    if GROUP_SIZE == 2 and USE_FP8:
         # A fixed pair reuses its prepared Q and visibility across all K tiles.
         pair_rows = start + tl.arange(0, 2)
         pair_lens = tl.minimum(tl.load(lengths + pair_rows), L)
@@ -1399,9 +1419,33 @@ def _fp8_index_logits_grouped_kernel(
         payload, exps = _load_fp4_index_keys(
             table, slot, valid, page_size, cache_stride, 64
         )
-        k_fp8 = _expand_fp8_index_keys(payload, exps)
-        first_bad = _first_key_requiring_bf16(exps)
-        if GROUP_SIZE == 2:
+        if USE_FP8:
+            k_fp8 = _expand_fp8_index_keys(payload, exps)
+            first_bad = _first_key_requiring_bf16(exps)
+        else:
+            k_low, k_high = _expand_bf16_index_keys(payload, exps)
+            for offset in tl.range(0, GROUP_SIZE, loop_unroll_factor=1):
+                row = start + offset
+                lens = tl.minimum(tl.load(lengths + row), L)
+                acc = _bf16_index_dot(q, row, stride_qb, stride_qh, k_low, k_high, 32)
+                logits = _reduce_index_logits(acc, weights, row, stride_wb, 32, False)
+                logits = tl.where(cols < lens, logits, float("-inf"))
+                _store_single_index_logits(
+                    logits,
+                    row,
+                    lens,
+                    cols,
+                    tile,
+                    out,
+                    block_scores,
+                    L,
+                    out_stride,
+                    block_scores_stride,
+                    BLOCK_L,
+                    CANDIDATE_BLOCK_SIZE,
+                    WRITE_BLOCK_SCORES,
+                )
+        if USE_FP8 and GROUP_SIZE == 2:
             _score_paired_fp8_tile(
                 pair_q,
                 pair_exact,
@@ -1424,7 +1468,7 @@ def _fp8_index_logits_grouped_kernel(
                 CANDIDATE_BLOCK_SIZE,
                 WRITE_BLOCK_SCORES,
             )
-        else:
+        elif USE_FP8:
             # Keep one K tile live while scoring and writing one pair at a time.
             for pair in tl.range(0, GROUP_SIZE // 2, loop_unroll_factor=1):
                 row = start + pair * 2
@@ -1571,8 +1615,7 @@ def fp4_index_logits_paged(
         group_size = verify_tokens_per_request
         assert group_size > 0 and batch % group_size == 0
     if (
-        not use_fp8
-        or heads != 32
+        heads != 32
         or batch % group_size
         or candidate_mask is not None
         or candidate_blocks is not None
@@ -1636,7 +1679,7 @@ def fp4_index_logits_paged(
         workers = min(
             triton.cdiv(max_len, block_l), triton.cdiv(num_sms * waves, requests)
         )
-        _fp8_index_logits_grouped_kernel[(requests, workers)](
+        _fp4_index_logits_grouped_kernel[(requests, workers)](
             q,
             weights,
             req,
@@ -1661,6 +1704,7 @@ def fp4_index_logits_paged(
             WRITE_BLOCK_SCORES=return_block_scores,
             GROUP_SIZE=group_size,
             GROUP_LANES=triton.next_power_of_2(group_size),
+            USE_FP8=use_fp8,
             num_warps=4,
         )
     else:

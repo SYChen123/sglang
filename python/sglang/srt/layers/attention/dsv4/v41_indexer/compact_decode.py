@@ -109,9 +109,7 @@ def compact_decode(
         width, block_size=block_size if published is None else None
     )
     use_fp8 = envs.SGLANG_OPT_DSV41_DECODE_INDEXER_FP8.get()
-    k_reuse_group_size = (
-        inputs.k_reuse_group_size if published is None and use_fp8 else 1
-    )
+    k_reuse_group_size = inputs.k_reuse_group_size if published is None else 1
     if k_reuse_group_size == -1 and bs > rows_per_chunk:
         # Keep request reuse if the existing chunks preserve complete requests.
         verify_width = inputs.verify_tokens_per_request

@@ -701,6 +701,8 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    SGLANG_OPT_MOONCAKE_NVLINK_LAYER_BATCH = EnvBool(True)
+    SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS = EnvFloat(0.0)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
     # Retained only to reject the removed setting during startup.
@@ -1643,8 +1645,10 @@ class Envs:
     SGLANG_DSV41_SM90_PREFILL_INDEXER_DEEPGEMM_MIN_ROWS = EnvInt(128)
     # H20 ablations for the scorer budget, prefill selection, and verify K tiles.
     SGLANG_OPT_DSV41_LARGE_INDEXER_SCORE_BUDGET = EnvBool(True)
+    SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
     SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION = EnvBool(True)
     SGLANG_OPT_DSV41_VERIFY_INDEXER_K_REUSE = EnvBool(True)
+    SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE = EnvBool(False)
     # Hopper decode/verify: fuse FP4 K unpacking with an FP8 dot, retaining
     # BF16 post-dot rounds and a BF16 fallback for out-of-range inputs.
     SGLANG_OPT_DSV41_DECODE_INDEXER_FP8 = EnvBool(False)
