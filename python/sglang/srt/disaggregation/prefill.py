@@ -1685,8 +1685,8 @@ class SchedulerDisaggregationPrefillMixin:
             )
             if (
                 segment_is_last
-                and self.pp_size == 1
                 and envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
+                and get_parallel().pp_size == 1
                 and hasattr(
                     self.disagg_prefill_bootstrap_queue.kv_manager,
                     "wait_for_transfer_rooms",
