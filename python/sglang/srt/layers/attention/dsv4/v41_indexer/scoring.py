@@ -358,7 +358,12 @@ def prefill_requests(
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
         # Keep BF16 GEMM output rows aligned for Hopper tensor-core kernels.
         # Pad K once per request; padded positions never enter selection.
-        if index_k.is_cuda and index_k.dtype == torch.bfloat16 and lc >= 1024:
+        if (
+            not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+            and index_k.is_cuda
+            and index_k.dtype == torch.bfloat16
+            and lc >= 1024
+        ):
             score_width = (lc + 63) // 64 * 64
             if score_width != lc:
                 index_k = torch.nn.functional.pad(index_k, (0, 0, 0, score_width - lc))
@@ -396,7 +401,8 @@ def _score_chunks(
         else 0
     )
     candidate_only = (
-        candidate_width > 0
+        not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+        and candidate_width > 0
         and candidate_width * 2 <= lc
         and q.is_cuda
         and torch.version.hip is None

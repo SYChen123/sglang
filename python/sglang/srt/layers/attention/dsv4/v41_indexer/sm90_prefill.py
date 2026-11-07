@@ -16,6 +16,8 @@ from sglang.srt.runtime_context import get_platform
 if TYPE_CHECKING:
     from .types import PrefillInputs
 
+_SCORE_BUDGET_BYTES = 64 << 20
+
 
 def use_sm90_prefill(inputs: PrefillInputs) -> bool:
     return (
@@ -63,13 +65,13 @@ def prefill_requests(
 
     # Only the final [query, key] FP32 scores are materialized.
     score_budget_bytes = (
-        2048
+        2048 << 20
         if (
             envs.SGLANG_OPT_DSV41_LARGE_INDEXER_SCORE_BUDGET.get()
             or envs.SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET.get()
         )
-        else 64
-    ) << 20
+        else _SCORE_BUDGET_BYTES
+    )
     inputs.reset_outputs()
     counts, seq_lens = inputs.rows_per_request, inputs.seq_lens_cpu
     assert len(counts) == len(seq_lens) == inputs.req_pool_indices.numel()

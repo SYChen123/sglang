@@ -1,6 +1,7 @@
 """Hopper prefill preserves FP4 layout, BF16 rounding and CP row ownership."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -150,7 +151,12 @@ class TestSM90Prefill(CustomTestCase):
                     use_deep_gemm_decode=False,
                 )
                 # Force multiple logits chunks without reducing model chunk size.
-                with patch.object(sm90_prefill, "_SCORE_BUDGET_BYTES", 1024):
+                with (
+                    envs.SGLANG_DSV41_SM90_PREFILL_INDEXER.override("triton"),
+                    envs.SGLANG_OPT_DSV41_LARGE_INDEXER_SCORE_BUDGET.override(False),
+                    envs.SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET.override(False),
+                    patch.object(sm90_prefill, "_SCORE_BUDGET_BYTES", 1024),
+                ):
                     backend.topk_prefill(inputs)
                 for row, request_id in enumerate((2, 2, 2, 8, 8)):
                     visible = (int(positions[row]) + 1) // ratio
@@ -333,6 +339,26 @@ class TestSM90Prefill(CustomTestCase):
                         )
                     )
 
+    def test_forced_torch_scores_skip_fused_head_epilogue(self):
+        from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
+
+        q = torch.randn(3, 32, 128, device="cuda").bfloat16()
+        keys = torch.randn(259, 128, device="cuda").bfloat16()
+        weights = torch.randn(3, 32, device="cuda").bfloat16()
+        with (
+            envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(True),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.index_score_reduce.reduce_head_scores",
+                side_effect=AssertionError(
+                    "Forced Torch must use the reference epilogue"
+                ),
+            ),
+        ):
+            actual = DeepseekV41Indexer.scores(None, q, keys, weights)
+        torch.testing.assert_close(
+            actual, rounded_scores(q, keys, weights), rtol=0, atol=0
+        )
+
     def test_compact_scores_per_query_holes_partial_blocks_and_graph_replay(self):
         """Candidate columns retain dense scores as row mappings and lengths change."""
         for heads in (32, 64):
@@ -432,13 +458,33 @@ class TestSM90Prefill(CustomTestCase):
             candidate_block_size=8,
             use_deep_gemm_prefill=False,
         )
-        for mode in ("triton", "auto", "torch"):
+        for mode in ("triton", "auto", "torch", "deepgemm"):
             with (
                 envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(mode == "torch"),
                 envs.SGLANG_DSV41_SM90_PREFILL_INDEXER.override(
-                    "auto" if mode == "torch" else mode
+                    "deepgemm" if mode == "torch" else mode
                 ),
                 envs.SGLANG_DSV41_SM90_PREFILL_INDEXER_DEEPGEMM_MIN_ROWS.override(128),
+                (
+                    patch(
+                        "sglang.kernels.ops.attention.dsv4.sm90_fp8_prefill.fp8_index_logits_prefill",
+                        side_effect=AssertionError(
+                            "Fixed paths must skip the Triton FP8 scorer"
+                        ),
+                    )
+                    if mode in ("torch", "deepgemm")
+                    else nullcontext()
+                ),
+                (
+                    patch(
+                        "sglang.kernels.ops.attention.dsv4.candidate_scores.candidate_scores",
+                        side_effect=AssertionError(
+                            "Forced Torch must score the full request"
+                        ),
+                    )
+                    if mode == "torch"
+                    else nullcontext()
+                ),
             ):
                 backend.consume_prefill(inputs, published)
                 for row, req in enumerate((3, 3, 2)):

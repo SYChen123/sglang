@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_gfx95_supported
@@ -288,7 +289,8 @@ class DeepseekV41Indexer(nn.Module):
         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads."""
         s = torch.einsum("bhd,nd->bhn", q, k)
         if (
-            s.is_cuda
+            not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+            and s.is_cuda
             and torch.version.hip is None
             and s.dtype == weights.dtype == torch.bfloat16
             and s.shape[1] <= 64
