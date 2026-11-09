@@ -315,7 +315,6 @@ def prefill_requests(
             token_to_kv_pool,
             req_to_token,
             candidate_blocks=candidate_blocks,
-            candidate_block_size=candidate_block_size,
         )
         return
     pool = token_to_kv_pool

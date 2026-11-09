@@ -412,7 +412,6 @@ del _fn
 for _fn in (
     "unpack_fp4_index_keys_to_fp8",
     "quantize_bf16_index_queries_fp8",
-    "fp8_index_logits_prefill",
 ):
     register_kernel(
         KernelSpec(

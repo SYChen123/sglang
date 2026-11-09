@@ -8,11 +8,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.dsv4.sm90_fp8_prefill import (
-    fp8_index_logits_prefill,
     quantize_bf16_index_queries_fp8,
     unpack_fp4_index_keys_to_fp8,
 )
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
     BlockIds,
@@ -74,47 +72,15 @@ class TestSM90Prefill(CustomTestCase):
         expected = q.float().clamp(-448, 448).to(torch.float8_e4m3fn)
         self.assertTrue(torch.equal(actual.float(), expected.float()))
 
-    def test_scores_rounding_signed_weights_odd_width_and_empty_rows(self):
-        for heads in (32, 64):
-            with self.subTest(heads=heads):
-                table, values = packed_keys(259)
-                slots = torch.arange(259, device="cuda").flip(0)
-                keys = unpack_fp4_index_keys_to_fp8(slots, table, 16)
-                q = values[torch.randint(0, 259, (6, heads), device="cuda")]
-                q8 = quantize_bf16_index_queries_fp8(q)
-                weights = torch.randn(6, heads, device="cuda").bfloat16()
-                lens = torch.tensor(
-                    [0, 1, 3, 63, 258, 259], device="cuda", dtype=torch.int32
-                )
-                actual = fp8_index_logits_prefill(q8, weights, keys, lens)
-                ref = rounded_scores(q8.bfloat16(), keys.bfloat16(), weights)
-                visible = torch.arange(259, device="cuda")[None, :] < lens[:, None]
-                torch.testing.assert_close(
-                    actual[visible], ref[visible], rtol=0, atol=0
-                )
-                self.assertTrue(torch.isneginf(actual[~visible]).all())
-                self.assertEqual(actual.stride(0) % 4, 0)
-                selected = torch.empty(6, 7, device="cuda", dtype=torch.int32)
-                topk_transform_ragged_v2(
-                    actual,
-                    lens,
-                    out_offsets=torch.zeros_like(lens),
-                    out_indices=selected,
-                )
-                self.assertTrue(
-                    torch.equal((selected >= 0).sum(1), lens.clamp(max=7).long())
-                )
-                self.assertTrue(((selected < lens[:, None]) | (selected < 0)).all())
-
     def test_runtime_cp_empty_shard_padding_multi_chunk_and_candidate_underfill(self):
-        from sglang.srt.layers.attention.dsv4.v41_indexer import sm90_prefill
+        from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
 
         table, values = packed_keys(10 * 512)
         pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda _: table)
         for ratio in (1, 2):
             with (
                 self.subTest(ratio=ratio),
-                envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(False),
+                envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(True),
             ):
                 req_table = torch.arange(10 * 512, device="cuda").view(10, 512) * ratio
                 positions = torch.tensor([0, 4, 256, 2, 32, 0, 0], device="cuda")
@@ -128,6 +94,7 @@ class TestSM90Prefill(CustomTestCase):
                         n_local_heads=32,
                         queries=lambda q, freqs: q,
                         head_weights=lambda x: x,
+                        scores=rounded_scores,
                     ),
                     layer_id=0,
                     compress_ratio=ratio,
@@ -152,10 +119,9 @@ class TestSM90Prefill(CustomTestCase):
                 )
                 # Force multiple logits chunks without reducing model chunk size.
                 with (
-                    envs.SGLANG_DSV41_SM90_PREFILL_INDEXER.override("triton"),
                     envs.SGLANG_OPT_DSV41_LARGE_INDEXER_SCORE_BUDGET.override(False),
                     envs.SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET.override(False),
-                    patch.object(sm90_prefill, "_SCORE_BUDGET_BYTES", 1024),
+                    patch.object(scoring, "_TORCH_SCORE_BUDGET_BYTES", 1024),
                 ):
                     backend.topk_prefill(inputs)
                 for row, request_id in enumerate((2, 2, 2, 8, 8)):
@@ -359,55 +325,6 @@ class TestSM90Prefill(CustomTestCase):
             actual, rounded_scores(q, keys, weights), rtol=0, atol=0
         )
 
-    def test_compact_scores_per_query_holes_partial_blocks_and_graph_replay(self):
-        """Candidate columns retain dense scores as row mappings and lengths change."""
-        for heads in (32, 64):
-            table, values = packed_keys(259)
-            keys = unpack_fp4_index_keys_to_fp8(
-                torch.arange(259, device="cuda"), table, 16
-            )
-            q = quantize_bf16_index_queries_fp8(
-                values[torch.randint(0, 259, (5, heads), device="cuda")]
-            )
-            weights = torch.randn(5, heads, device="cuda").bfloat16()
-            lens = torch.tensor([0, 1, 63, 258, 259], device="cuda", dtype=torch.int32)
-            # Different candidates for every Q, unordered, with interior holes,
-            # a partial final block, and an out-of-range positive block id.
-            blocks = torch.tensor(
-                [[0, -1, 1], [0, 2, -1], [7, -1, 0], [32, 1, 9], [3, 32, 100]],
-                device="cuda",
-                dtype=torch.int32,
-            )
-
-            def score():
-                return fp8_index_logits_prefill(
-                    q, weights, keys, lens, candidate_blocks=blocks
-                )
-
-            for _ in range(2):
-                score()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                captured = score()
-            for replay in range(2):
-                if replay:
-                    blocks.copy_(blocks.flip(0))
-                    lens.copy_(torch.tensor([259, 63, 0, 1, 258], device="cuda"))
-                graph.replay()
-                dense = fp8_index_logits_prefill(q, weights, keys, lens)
-                logical = (
-                    blocks[:, :, None].long() * 8
-                    + torch.arange(8, device="cuda")[None, None, :]
-                ).flatten(1)
-                valid = (blocks >= 0).repeat_interleave(8, 1)
-                valid &= logical < lens[:, None]
-                valid &= logical < keys.shape[0]
-                reference = dense.gather(1, logical.clamp(0, 258)).masked_fill(
-                    ~valid, -torch.inf
-                )
-                torch.testing.assert_close(captured, reference, rtol=0, atol=0)
-                self.assertEqual(captured.shape, (5, 24))
-
     def test_compact_cp_tail_maps_distinct_candidates_to_pool_slots(self):
         """A bounded CP tail uses its published rows, never padded encoder rows."""
         table, values = packed_keys(4 * 512)
@@ -458,23 +375,10 @@ class TestSM90Prefill(CustomTestCase):
             candidate_block_size=8,
             use_deep_gemm_prefill=False,
         )
-        for mode in ("triton", "auto", "torch", "deepgemm"):
+        for mode in ("torch", "deepgemm"):
             with (
                 envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(mode == "torch"),
-                envs.SGLANG_DSV41_SM90_PREFILL_INDEXER.override(
-                    "deepgemm" if mode == "torch" else mode
-                ),
-                envs.SGLANG_DSV41_SM90_PREFILL_INDEXER_DEEPGEMM_MIN_ROWS.override(128),
-                (
-                    patch(
-                        "sglang.kernels.ops.attention.dsv4.sm90_fp8_prefill.fp8_index_logits_prefill",
-                        side_effect=AssertionError(
-                            "Fixed paths must skip the Triton FP8 scorer"
-                        ),
-                    )
-                    if mode in ("torch", "deepgemm")
-                    else nullcontext()
-                ),
+                envs.SGLANG_DSV41_SM90_PREFILL_INDEXER.override("deepgemm"),
                 (
                     patch(
                         "sglang.kernels.ops.attention.dsv4.candidate_scores.candidate_scores",
