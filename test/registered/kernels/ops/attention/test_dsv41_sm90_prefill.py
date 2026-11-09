@@ -75,8 +75,10 @@ class TestSM90Prefill(CustomTestCase):
     def test_runtime_cp_empty_shard_padding_multi_chunk_and_candidate_underfill(self):
         from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
 
-        table, values = packed_keys(10 * 512)
-        pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda _: table)
+        _, values = packed_keys(10 * 512)
+        pool = SimpleNamespace(
+            get_low_ratio_index_k_dequant=lambda _, slots: values[slots]
+        )
         for ratio in (1, 2):
             with (
                 self.subTest(ratio=ratio),
