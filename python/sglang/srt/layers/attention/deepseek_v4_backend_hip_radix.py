@@ -3249,7 +3249,10 @@ class DeepseekV4HipRadixBackend(
                 self, layer, x, q_lora, pos, forward_batch=forward_batch
             )
         elif forward_batch.forward_mode.is_extend():
-            if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
+            if (
+                envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.is_set()
+                and envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+            ):
                 raise NotImplementedError(
                     "SGLANG_DSV41_TORCH_PREFILL_INDEXER (the torch prefill indexer "
                     "oracle) is not supported on HIP"

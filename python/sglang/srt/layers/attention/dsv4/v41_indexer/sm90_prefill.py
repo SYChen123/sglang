@@ -54,11 +54,8 @@ def prefill_requests(
 
     # Only the final [query, key] FP32 scores are materialized.
     score_budget_bytes = (
-        2048 << 20
-        if (
-            envs.SGLANG_OPT_DSV41_LARGE_INDEXER_SCORE_BUDGET.get()
-            or envs.SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET.get()
-        )
+        2 << 30
+        if envs.SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET.get()
         else _SCORE_BUDGET_BYTES
     )
     inputs.reset_outputs()

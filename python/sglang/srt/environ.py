@@ -1635,13 +1635,13 @@ class Envs:
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
-    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(True)
     # Hopper prefill FP8 scorer. Forced Torch prefill bypasses this path.
     SGLANG_DSV41_SM90_PREFILL_INDEXER = EnvStr("deepgemm")
-    # H20 ablations for the scorer budget, prefill selection, and verify K tiles.
+    # Decode score budget and opt-in H20 prefill/verify changes.
     SGLANG_OPT_DSV41_LARGE_INDEXER_SCORE_BUDGET = EnvBool(True)
     SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
-    SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION = EnvBool(True)
+    SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION = EnvBool(False)
     SGLANG_OPT_DSV41_VERIFY_INDEXER_K_REUSE = EnvBool(True)
     SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE = EnvBool(False)
     # Hopper decode/verify: fuse FP4 K unpacking with an FP8 dot, retaining
