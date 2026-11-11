@@ -329,6 +329,7 @@ def _run_mega_routed(
         ),
         shared_l1_weights=moe.mega_shared_l1_weights,
         shared_l2_weights=moe.mega_shared_l2_weights,
+        forward_batch=forward_batch,
     )
 
 
@@ -347,6 +348,7 @@ def run_mega_routed_experts(
     num_shared_experts: int = 0,
     shared_l1_weights=None,
     shared_l2_weights=None,
+    forward_batch: Optional[ForwardBatch] = None,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
@@ -395,6 +397,7 @@ def run_mega_routed_experts(
             hidden_size=hidden_size,
             activation_clamp=activation_clamp,
             routed_scaling_factor=routed_scaling_factor,
+            forward_batch=forward_batch,
         )
 
     if routed_scaling_factor != 1.0:

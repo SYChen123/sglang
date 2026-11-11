@@ -173,6 +173,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    _device_sm,
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
     quant_blocks_shared_experts_fusion,
@@ -193,6 +194,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -4107,6 +4109,32 @@ class DeepseekV4Model(nn.Module):
             assert getattr(config, "num_hash_layers", 0) <= self.late_layer_start, (
                 "decoder SWA bounded replay needs hash routing before the late layers"
             )
+            parallel = get_parallel()
+            if (
+                _device_sm == 90
+                and config.model_type == "deepseek_v41"
+                and get_disagg().disaggregation_mode != "decode"
+                and get_moe_a2a_backend().is_megamoe()
+                and parallel.attn_cp_size == parallel.moe_ep_size == 4
+                and parallel.attn_cp_group.ranks == parallel.moe_ep_group.ranks
+                and (
+                    config.hidden_size,
+                    config.moe_intermediate_size,
+                    config.n_routed_experts,
+                    config.num_experts_per_tok,
+                )
+                == (5120, 2304, 384, 6)
+            ):
+                # Only tail layers need both weight layouts. Their CP padding
+                # provides a common physical MoE row count across all EP ranks.
+                first_tail_layer = max(self.start_layer, self.late_layer_start)
+                for i in range(first_tail_layer, self.end_layer):
+                    mlp = self.layers[i].mlp
+                    if (
+                        mlp.experts.num_experts == 384
+                        and mlp.num_fused_shared_experts == 0
+                    ):
+                        mlp.experts._mega_moe_sm90_fp4_prepare_tail_rs = True
         # Only vision routing reads token IDs in the late layers.
         self.late_layer_vl_routing = (
             config.model_type == "deepseek_v41"

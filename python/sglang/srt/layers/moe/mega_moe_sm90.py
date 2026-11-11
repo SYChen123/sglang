@@ -24,6 +24,8 @@ from sglang.srt.models.deepseek_common.utils import _device_sm
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
 
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 
 def is_sm90_fp8_mega_moe_available(experts) -> bool:
     if _device_sm != 90:
@@ -68,6 +70,7 @@ def run_sm90_mega_routed(
     hidden_size: int,
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
+    forward_batch: Optional[ForwardBatch] = None,
 ) -> torch.Tensor:
     import deep_gemm
 
@@ -91,10 +94,24 @@ def run_sm90_mega_routed(
     )
     use_fp4 = getattr(experts, "_mega_moe_sm90_fp4_weights", False)
     mega_moe = deep_gemm.fp8_fp4_mega_moe if use_fp4 else deep_gemm.fp8_mega_moe
+    l1, l2 = experts.mega_l1_weights, experts.mega_l2_weights
+    register_weights = getattr(experts, "_mega_moe_sm90_fp4_tail_rs_weights", None)
+    # The row limit is for the RS layout. DeepGEMM selects swapAB for the
+    # ordinary layout using its routing-density heuristic.
+    if (
+        register_weights is not None
+        and 0 < num_tokens <= experts._mega_moe_sm90_fp4_tail_rs_max_tokens
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_extend_without_speculative()
+    ):
+        cp_rows = getattr(forward_batch.attn_cp_metadata, "per_rank_actual_token", None)
+        # The RS launch changes how many CTAs reach the inter-rank barrier.
+        if cp_rows == [num_tokens] * 4:
+            l1, l2 = register_weights
     mega_moe(
         y,
-        experts.mega_l1_weights,
-        experts.mega_l2_weights,
+        l1,
+        l2,
         buf,
         recipe=(1, 1, 32) if use_fp4 else (128, 128, 128),
         activation="swiglu",
@@ -249,6 +266,20 @@ def build_sm90_fp4_mega_moe_experts_weights(
         (w13.view(torch.int8), fp32_scales[0]),
         (w2.view(torch.int8), fp32_scales[1]),
     )
+    if getattr(experts, "_mega_moe_sm90_fp4_prepare_tail_rs", False):
+        max_tokens = getattr(deep_gemm, "get_sm90_fp4_register_max_tokens", None)
+        pack = getattr(deep_gemm, "pack_sm90_fp4_register_weights", None)
+        if (
+            max_tokens is not None
+            and pack is not None
+            and l1[0].shape == (96, 4608, 2560)
+            and l2[0].shape == (96, 5120, 1152)
+        ):
+            experts._mega_moe_sm90_fp4_tail_rs_weights = (
+                (pack(l1[0]), l1[1]),
+                (pack(l2[0]), l2[1]),
+            )
+            experts._mega_moe_sm90_fp4_tail_rs_max_tokens = max_tokens()
     experts.w13_weight.data, scales[0].data = l1
     experts.w2_weight.data, scales[1].data = l2
     for scale in scales:
