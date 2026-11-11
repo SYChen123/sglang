@@ -5262,14 +5262,20 @@ class DeepseekV4ForCausalLM(nn.Module):
         if layer is None:
             return
 
-        from sglang.kernels.ops.layernorm.mhc import mhc_post, prewarm_mhc_pre
+        from sglang.kernels.ops.layernorm.mhc import (
+            hc_broadcast,
+            mhc_post,
+            prewarm_mhc_pre,
+        )
 
         tic = time.perf_counter()
-        residual = torch.zeros(
-            (1, layer.hc_mult, layer.hidden_size),
+        hidden_states = torch.zeros(
+            (1, layer.hidden_size),
             dtype=torch.bfloat16,
             device=layer.hc_attn_fn.device,
         )
+        # Load the broadcast kernel before the first forward's collectives.
+        residual = hc_broadcast(hidden_states, layer.hc_mult)
         prewarm_mhc_pre(
             # Template carrying dtype/device; buckets allocate their own sizes.
             residual=residual,
@@ -5287,7 +5293,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             norm_eps=layer.input_layernorm.variance_epsilon,
         )
         mhc_post(
-            x=residual.new_zeros((1, layer.hidden_size)),
+            x=hidden_states,
             residual=residual,
             post_layer_mix=torch.zeros(
                 (1, layer.hc_mult, 1),
