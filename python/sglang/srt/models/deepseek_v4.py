@@ -4125,8 +4125,8 @@ class DeepseekV4Model(nn.Module):
                 )
                 == (5120, 2304, 384, 6)
             ):
-                # Only tail layers need both weight layouts. Their CP padding
-                # provides a common physical MoE row count across all EP ranks.
+                # Tail layers have a common physical MoE row count across EP ranks.
+                # This allows all ranks to select the same RS launch.
                 first_tail_layer = max(self.start_layer, self.late_layer_start)
                 for i in range(first_tail_layer, self.end_layer):
                     mlp = self.layers[i].mlp
@@ -4134,7 +4134,7 @@ class DeepseekV4Model(nn.Module):
                         mlp.experts.num_experts == 384
                         and mlp.num_fused_shared_experts == 0
                     ):
-                        mlp.experts._mega_moe_sm90_fp4_prepare_tail_rs = True
+                        mlp.experts._mega_moe_sm90_fp4_enable_tail_rs = True
         # Only vision routing reads token IDs in the late layers.
         self.late_layer_vl_routing = (
             config.model_type == "deepseek_v41"

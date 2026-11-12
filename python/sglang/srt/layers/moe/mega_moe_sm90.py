@@ -95,19 +95,18 @@ def run_sm90_mega_routed(
     use_fp4 = getattr(experts, "_mega_moe_sm90_fp4_weights", False)
     mega_moe = deep_gemm.fp8_fp4_mega_moe if use_fp4 else deep_gemm.fp8_mega_moe
     l1, l2 = experts.mega_l1_weights, experts.mega_l2_weights
-    register_weights = getattr(experts, "_mega_moe_sm90_fp4_tail_rs_weights", None)
-    # The row limit is for the RS layout. DeepGEMM selects swapAB for the
-    # ordinary layout using its routing-density heuristic.
+    rs_max_tokens = getattr(experts, "_mega_moe_sm90_fp4_tail_rs_max_tokens", 0)
+    kernel_options = {}
     if (
-        register_weights is not None
-        and 0 < num_tokens <= experts._mega_moe_sm90_fp4_tail_rs_max_tokens
+        use_fp4
+        and 0 < num_tokens <= rs_max_tokens
         and forward_batch is not None
         and forward_batch.forward_mode.is_extend_without_speculative()
     ):
         cp_rows = getattr(forward_batch.attn_cp_metadata, "per_rank_actual_token", None)
-        # The RS launch changes how many CTAs reach the inter-rank barrier.
+        # RS changes the CTA count. All EP ranks must agree on the kernel.
         if cp_rows == [num_tokens] * 4:
-            l1, l2 = register_weights
+            kernel_options["use_sm90_register_weights"] = True
     mega_moe(
         y,
         l1,
@@ -117,6 +116,7 @@ def run_sm90_mega_routed(
         activation="swiglu",
         activation_clamp=activation_clamp,
         fast_math=True,
+        **kernel_options,
     )
     y = y[:num_tokens]
 
@@ -266,19 +266,13 @@ def build_sm90_fp4_mega_moe_experts_weights(
         (w13.view(torch.int8), fp32_scales[0]),
         (w2.view(torch.int8), fp32_scales[1]),
     )
-    if getattr(experts, "_mega_moe_sm90_fp4_prepare_tail_rs", False):
-        max_tokens = getattr(deep_gemm, "get_sm90_fp4_register_max_tokens", None)
-        pack = getattr(deep_gemm, "pack_sm90_fp4_register_weights", None)
-        if (
-            max_tokens is not None
-            and pack is not None
-            and l1[0].shape == (96, 4608, 2560)
-            and l2[0].shape == (96, 5120, 1152)
-        ):
-            experts._mega_moe_sm90_fp4_tail_rs_weights = (
-                (pack(l1[0]), l1[1]),
-                (pack(l2[0]), l2[1]),
-            )
+    if (
+        getattr(experts, "_mega_moe_sm90_fp4_enable_tail_rs", False)
+        and l1[0].shape == (96, 4608, 2560)
+        and l2[0].shape == (96, 5120, 1152)
+    ):
+        max_tokens = getattr(deep_gemm, "get_sm90_fp4_row_major_rs_max_tokens", None)
+        if max_tokens is not None:
             experts._mega_moe_sm90_fp4_tail_rs_max_tokens = max_tokens()
     experts.w13_weight.data, scales[0].data = l1
     experts.w2_weight.data, scales[1].data = l2
