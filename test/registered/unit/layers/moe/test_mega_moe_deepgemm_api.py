@@ -272,22 +272,25 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     self.assertEqual(pair[1].dtype, torch.float32)
                     self.assertTrue(torch.equal(pair[1], torch.ones_like(pair[1])))
 
-    def test_sm90_fp4_tail_selects_rs_with_shared_weights(self):
+    def test_sm90_fp4_tail_selects_rs_with_paired_weights(self):
         dg = self.deep_gemm
         dg.mega_moe_pre_dispatch_sm90 = MagicMock()
         dg.fp8_fp4_mega_moe = MagicMock()
-        dg.get_sm90_fp4_row_major_rs_max_tokens = MagicMock(return_value=128)
-        dg.pack_sm90_fp4_register_weights = MagicMock()
+        dg.get_sm90_fp4_register_max_tokens = MagicMock(return_value=128)
         shapes = ((96, 4608, 2560), (96, 5120, 1152))
         weights = [torch.empty(s, dtype=torch.int8, device="meta") for s in shapes]
         scales = [torch.empty((e, n, k // 16), device="meta") for e, n, k in shapes]
         transformed = tuple(
-            (w, torch.empty((e, n, k // 64), dtype=torch.int32, device="meta"))
-            for w, (e, n, k) in zip(weights, shapes)
+            (
+                torch.empty((e, n, k, 1), dtype=torch.int8, device="meta"),
+                torch.empty((e, n, k // 64), dtype=torch.int32, device="meta"),
+            )
+            for e, n, k in shapes
         )
         dg.transform_weights_for_mega_moe_sm90_fp4 = MagicMock(return_value=transformed)
         experts = SimpleNamespace(
             _mega_moe_sm90_fp4_enable_tail_rs=True,
+            _mega_moe_sm90_fp4_pack_tail_rs=True,
             w13_weight=torch.nn.Parameter(weights[0], requires_grad=False),
             w2_weight=torch.nn.Parameter(weights[1], requires_grad=False),
             w13_weight_scale_inv=torch.nn.Parameter(scales[0], requires_grad=False),
@@ -296,6 +299,14 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         buf = SimpleNamespace(x=None, x_sf=None, topk_idx=None, topk_weights=None)
         with patch.dict(sys.modules, {"deep_gemm": dg}):
             mega_moe_sm90.build_sm90_fp4_mega_moe_experts_weights(experts)
+            self.assertEqual(
+                dg.transform_weights_for_mega_moe_sm90_fp4.call_args.kwargs,
+                {"pack_for_register_weights": True},
+            )
+            for param, original in zip(
+                (experts.w13_weight, experts.w2_weight), transformed
+            ):
+                self.assertTrue(torch._C._is_alias_of(param, original[0]))
             for prefill, rows, cp_rows, expected_rs in (
                 (True, 0, [0] * 4, False),
                 (True, 1, [1] * 4, True),
@@ -330,15 +341,14 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     )
                     call_args = dg.fp8_fp4_mega_moe.call_args
                     for actual, original in zip(call_args.args[1:3], transformed):
-                        self.assertEqual(actual[0].ndim, 3)
+                        self.assertEqual(actual[0].ndim, 4)
                         for tensor, source in zip(actual, original):
                             self.assertTrue(torch._C._is_alias_of(tensor, source))
                     self.assertEqual(
-                        call_args.kwargs.get("use_sm90_register_weights", False),
-                        expected_rs,
+                        call_args.kwargs["use_sm90_packed_ss"], not expected_rs
                     )
-                    self.assertNotIn("disable_sm90_swap_ab", call_args.kwargs)
-        dg.pack_sm90_fp4_register_weights.assert_not_called()
+                    self.assertNotIn("use_sm90_register_weights", call_args.kwargs)
+        dg.transform_weights_for_mega_moe_sm90_fp4.assert_called_once()
 
     def test_sm90_fp4_rejects_old_api_and_fp4_activations(self):
         dg = ModuleType("deep_gemm")

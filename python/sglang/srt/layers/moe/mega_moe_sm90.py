@@ -97,6 +97,7 @@ def run_sm90_mega_routed(
     l1, l2 = experts.mega_l1_weights, experts.mega_l2_weights
     rs_max_tokens = getattr(experts, "_mega_moe_sm90_fp4_tail_rs_max_tokens", 0)
     kernel_options = {}
+    use_rs = False
     if (
         use_fp4
         and 0 < num_tokens <= rs_max_tokens
@@ -105,8 +106,13 @@ def run_sm90_mega_routed(
     ):
         cp_rows = getattr(forward_batch.attn_cp_metadata, "per_rank_actual_token", None)
         # RS changes the CTA count. All EP ranks must agree on the kernel.
-        if cp_rows == [num_tokens] * 4:
-            kernel_options["use_sm90_register_weights"] = True
+        use_rs = cp_rows == [num_tokens] * 4
+    if use_fp4 and l1[0].ndim == 4:
+        # Paired weights select RS by default. Oversized or nonuniform batches
+        # use the SS decoder on the same storage.
+        kernel_options["use_sm90_packed_ss"] = not use_rs
+    elif use_rs:
+        kernel_options["use_sm90_register_weights"] = True
     mega_moe(
         y,
         l1,
@@ -195,7 +201,8 @@ def build_sm90_fp4_mega_moe_experts_weights(
 
     The DeepGEMM PR #53 transform interleaves gate/up in gran-8 rows and packs
     four UE8M0 bytes per int32 along K. This is not SM100's MN-major SF layout.
-    Replace parameters before KV sizing so a checkpoint-layout copy is not kept.
+    Prefill tail layers can use paired-row FP4 storage. Replace parameters
+    before KV sizing so each layer retains one weight layout.
     """
     if getattr(experts, "_mega_moe_weights_built", False):
         return
@@ -262,15 +269,25 @@ def build_sm90_fp4_mega_moe_experts_weights(
                 f"Expected FP32 or raw UE8M0 expert scales, got {scale.dtype}"
             )
 
+    tail_rs = (
+        getattr(experts, "_mega_moe_sm90_fp4_enable_tail_rs", False)
+        and w13.shape == (96, 4608, 2560)
+        and w2.shape == (96, 5120, 1152)
+    )
+    pack_tail_rs = tail_rs and getattr(
+        experts, "_mega_moe_sm90_fp4_pack_tail_rs", False
+    )
+    transform_options = {"pack_for_register_weights": True} if pack_tail_rs else {}
     l1, l2 = deep_gemm.transform_weights_for_mega_moe_sm90_fp4(
         (w13.view(torch.int8), fp32_scales[0]),
         (w2.view(torch.int8), fp32_scales[1]),
+        **transform_options,
     )
-    if (
-        getattr(experts, "_mega_moe_sm90_fp4_enable_tail_rs", False)
-        and l1[0].shape == (96, 4608, 2560)
-        and l2[0].shape == (96, 5120, 1152)
-    ):
+    if pack_tail_rs:
+        experts._mega_moe_sm90_fp4_tail_rs_max_tokens = (
+            deep_gemm.get_sm90_fp4_register_max_tokens()
+        )
+    elif tail_rs:
         max_tokens = getattr(deep_gemm, "get_sm90_fp4_row_major_rs_max_tokens", None)
         if max_tokens is not None:
             experts._mega_moe_sm90_fp4_tail_rs_max_tokens = max_tokens()

@@ -4110,10 +4110,11 @@ class DeepseekV4Model(nn.Module):
                 "decoder SWA bounded replay needs hash routing before the late layers"
             )
             parallel = get_parallel()
+            disaggregation_mode = get_disagg().disaggregation_mode
             if (
                 _device_sm == 90
                 and config.model_type == "deepseek_v41"
-                and get_disagg().disaggregation_mode != "decode"
+                and disaggregation_mode != "decode"
                 and get_moe_a2a_backend().is_megamoe()
                 and parallel.attn_cp_size == parallel.moe_ep_size == 4
                 and parallel.attn_cp_group.ranks == parallel.moe_ep_group.ranks
@@ -4135,6 +4136,9 @@ class DeepseekV4Model(nn.Module):
                         and mlp.num_fused_shared_experts == 0
                     ):
                         mlp.experts._mega_moe_sm90_fp4_enable_tail_rs = True
+                        mlp.experts._mega_moe_sm90_fp4_pack_tail_rs = (
+                            disaggregation_mode == "prefill"
+                        )
         # Only vision routing reads token IDs in the late layers.
         self.late_layer_vl_routing = (
             config.model_type == "deepseek_v41"
