@@ -127,6 +127,7 @@ def _get_mega_moe_symm_buffer(
     num_shared_experts: int = 0,
     *,
     mma_type: str,
+    sm90_fused_fp4: bool = False,
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -140,21 +141,32 @@ def _get_mega_moe_symm_buffer(
             intermediate_hidden,
             mma_type,
             num_shared_experts,
+            sm90_fused_fp4,
             deep_gemm.get_num_sms(),
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
-            buf = deep_gemm.get_symm_buffer_for_mega_moe(
-                group,
-                num_experts,
-                num_max_tokens_per_rank,
-                num_topk,
-                hidden,
-                intermediate_hidden,
-                num_shared_experts=num_shared_experts,
-                mma_type=mma_type,
-                activation="swiglu",
-            )
+            if sm90_fused_fp4:
+                buf = deep_gemm.get_symm_buffer_for_sm90_fused_mega_moe(
+                    group,
+                    num_experts,
+                    num_max_tokens_per_rank,
+                    num_topk,
+                    hidden,
+                    intermediate_hidden,
+                )
+            else:
+                buf = deep_gemm.get_symm_buffer_for_mega_moe(
+                    group,
+                    num_experts,
+                    num_max_tokens_per_rank,
+                    num_topk,
+                    hidden,
+                    intermediate_hidden,
+                    num_shared_experts=num_shared_experts,
+                    mma_type=mma_type,
+                    activation="swiglu",
+                )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
 
@@ -333,6 +345,41 @@ def _run_mega_routed(
     )
 
 
+def _get_sm90_fused_fp4_peer_bound(
+    parallel, forward_batch: Optional[ForwardBatch], local_rows: int
+) -> Optional[int]:
+    """Use physical row counts only when their metadata covers the EP group."""
+    ep_ranks = parallel.moe_ep_group.ranks
+    if len(ep_ranks) == 1:
+        return local_rows or None
+    if forward_batch is None:
+        return None
+
+    rows = getattr(forward_batch.attn_cp_metadata, "per_rank_actual_token", None)
+    if (
+        rows is not None
+        and len(rows) == len(ep_ranks)
+        and parallel.attn_cp_group.ranks == ep_ranks
+    ):
+        return max(rows) or None
+
+    # With one attention-TP rank per DP replica, padded DP rows are also
+    # physical MoE rows if the DP and EP groups contain the same ranks.
+    if (
+        parallel.attn_tp_size == 1
+        and parallel.attn_cp_size == 1
+        and parallel.attn_dp_size == parallel.moe_ep_size
+        and parallel.tp_group.ranks == ep_ranks
+    ):
+        rows = forward_batch.global_num_tokens_padded_cpu
+        if rows is None:
+            rows = forward_batch.global_num_tokens_cpu
+        if rows is not None and len(rows) == len(ep_ranks):
+            return max(rows) or None
+
+    return None
+
+
 def run_mega_routed_experts(
     experts,
     hidden_states: torch.Tensor,
@@ -355,7 +402,8 @@ def run_mega_routed_experts(
 
     from sglang.srt.runtime_context import get_parallel
 
-    ep_group = get_parallel().moe_ep_group.device_group
+    parallel = get_parallel()
+    ep_group = parallel.moe_ep_group.device_group
     num_experts = experts.num_experts
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
@@ -368,6 +416,9 @@ def run_mega_routed_experts(
     )
 
     mma_type = _mega_moe_mma_type(experts)
+    sm90_fused_fp4 = getattr(experts, "_mega_moe_sm90_fused_fp4", False)
+    if sm90_fused_fp4 and num_shared_experts:
+        raise ValueError("Fused SM90 W4A8 MegaMoE requires separate shared experts")
     buf = _get_mega_moe_symm_buffer(
         ep_group,
         num_experts=num_experts,
@@ -377,6 +428,7 @@ def run_mega_routed_experts(
         intermediate_hidden=intermediate_size,
         num_shared_experts=num_shared_experts,
         mma_type=mma_type,
+        sm90_fused_fp4=sm90_fused_fp4,
     )
 
     if num_tokens > 0:
@@ -387,6 +439,11 @@ def run_mega_routed_experts(
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
     if _device_sm == 90:
+        peer_bound = (
+            _get_sm90_fused_fp4_peer_bound(parallel, forward_batch, num_tokens)
+            if sm90_fused_fp4
+            else None
+        )
         return run_sm90_mega_routed(
             experts,
             hidden_states,
@@ -397,7 +454,7 @@ def run_mega_routed_experts(
             hidden_size=hidden_size,
             activation_clamp=activation_clamp,
             routed_scaling_factor=routed_scaling_factor,
-            forward_batch=forward_batch,
+            num_tokens_bound=peer_bound,
         )
 
     if routed_scaling_factor != 1.0:

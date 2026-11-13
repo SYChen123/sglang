@@ -24,8 +24,6 @@ from sglang.srt.models.deepseek_common.utils import _device_sm
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
 
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
 
 def is_sm90_fp8_mega_moe_available(experts) -> bool:
     if _device_sm != 90:
@@ -41,6 +39,18 @@ def is_sm90_fp8_mega_moe_available(experts) -> bool:
     )
 
 
+def _has_sm90_fused_fp4_api(deep_gemm) -> bool:
+    return all(
+        hasattr(deep_gemm, name)
+        for name in (
+            "fp8_mxfp4_mega_moe",
+            "get_symm_buffer_for_sm90_fused_mega_moe",
+            "mega_moe_pre_dispatch_sm90",
+            "transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90",
+        )
+    )
+
+
 def is_sm90_fp4_mega_moe_available(experts) -> bool:
     if _device_sm != 90 or not getattr(experts, "_mega_moe_sm90_fp4_weights", False):
         return False
@@ -48,6 +58,8 @@ def is_sm90_fp4_mega_moe_available(experts) -> bool:
         import deep_gemm
     except ImportError:
         return False
+    if getattr(experts, "_mega_moe_sm90_fused_fp4", False):
+        return _has_sm90_fused_fp4_api(deep_gemm)
     # The generic fp8_fp4_mega_moe symbol also exists in SM100-only builds.
     return all(
         hasattr(deep_gemm, name)
@@ -70,7 +82,7 @@ def run_sm90_mega_routed(
     hidden_size: int,
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
-    forward_batch: Optional[ForwardBatch] = None,
+    num_tokens_bound: Optional[int] = None,
 ) -> torch.Tensor:
     import deep_gemm
 
@@ -87,6 +99,25 @@ def run_sm90_mega_routed(
         routed_scaling_factor=routed_scaling_factor,
     )
 
+    if getattr(experts, "_mega_moe_sm90_fused_fp4", False):
+        # Use the current parameters so post-load staging and EPLB see the
+        # same storage as the kernel, including each expert's secondary scale.
+        scale1, scale2 = experts._mega_moe_sm90_fused_scale_names
+        y = torch.empty(
+            (num_tokens, hidden_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        deep_gemm.fp8_mxfp4_mega_moe(
+            y,
+            (experts.w13_weight, getattr(experts, scale1), experts.w13_mega_scale_2),
+            (experts.w2_weight, getattr(experts, scale2), experts.w2_mega_scale_2),
+            buf,
+            activation_clamp=activation_clamp,
+            num_tokens_bound=num_tokens_bound,
+        )
+        return y
+
     y = torch.empty(
         (max(num_tokens, 1), hidden_size),
         dtype=torch.bfloat16,
@@ -95,24 +126,6 @@ def run_sm90_mega_routed(
     use_fp4 = getattr(experts, "_mega_moe_sm90_fp4_weights", False)
     mega_moe = deep_gemm.fp8_fp4_mega_moe if use_fp4 else deep_gemm.fp8_mega_moe
     l1, l2 = experts.mega_l1_weights, experts.mega_l2_weights
-    rs_max_tokens = getattr(experts, "_mega_moe_sm90_fp4_tail_rs_max_tokens", 0)
-    kernel_options = {}
-    use_rs = False
-    if (
-        use_fp4
-        and 0 < num_tokens <= rs_max_tokens
-        and forward_batch is not None
-        and forward_batch.forward_mode.is_extend_without_speculative()
-    ):
-        cp_rows = getattr(forward_batch.attn_cp_metadata, "per_rank_actual_token", None)
-        # RS changes the CTA count. All EP ranks must agree on the kernel.
-        use_rs = cp_rows == [num_tokens] * 4
-    if use_fp4 and l1[0].ndim == 4:
-        # Paired weights select RS by default. Oversized or nonuniform batches
-        # use the SS decoder on the same storage.
-        kernel_options["use_sm90_packed_ss"] = not use_rs
-    elif use_rs:
-        kernel_options["use_sm90_register_weights"] = True
     mega_moe(
         y,
         l1,
@@ -122,7 +135,6 @@ def run_sm90_mega_routed(
         activation="swiglu",
         activation_clamp=activation_clamp,
         fast_math=True,
-        **kernel_options,
     )
     y = y[:num_tokens]
 
@@ -201,8 +213,8 @@ def build_sm90_fp4_mega_moe_experts_weights(
 
     The DeepGEMM PR #53 transform interleaves gate/up in gran-8 rows and packs
     four UE8M0 bytes per int32 along K. This is not SM100's MN-major SF layout.
-    Prefill tail layers can use paired-row FP4 storage. Replace parameters
-    before KV sizing so each layer retains one weight layout.
+    The PR #473 API uses tiled FP4 with relative exponents and per-expert
+    secondary scales. Replace parameters before KV sizing in either path.
     """
     if getattr(experts, "_mega_moe_weights_built", False):
         return
@@ -225,19 +237,19 @@ def build_sm90_fp4_mega_moe_experts_weights(
         )
     import deep_gemm
 
-    if not all(
+    has_fused = _has_sm90_fused_fp4_api(deep_gemm)
+    has_legacy = all(
         hasattr(deep_gemm, name)
         for name in (
             "fp8_fp4_mega_moe",
             "mega_moe_pre_dispatch_sm90",
             "transform_weights_for_mega_moe_sm90_fp4",
         )
-    ):
+    )
+    if not (has_fused or has_legacy):
         raise RuntimeError(
-            "SM90 W4A8 MegaMoE requires a build of DeepGEMM PR #53 "
-            "(b5675bf7c812a583d6eadabfa23ad1e00207c39d). The released "
-            "SM100-only fp8_fp4_mega_moe API is insufficient; see "
-            "3rdparty/DeepGEMM and scripts/sm90_w4a8_megamoe/README.md."
+            "SM90 W4A8 MegaMoE requires the SM90 APIs from DeepGEMM PR #53 "
+            "or PR #473. The generic SM100 fp8_fp4_mega_moe API is insufficient."
         )
 
     w13, w2 = experts.w13_weight.data, experts.w2_weight.data
@@ -258,6 +270,36 @@ def build_sm90_fp4_mega_moe_experts_weights(
     if not 0 < w2.shape[2] * 2 <= 4096:
         raise ValueError("SM90 W4A8 MegaMoE requires 0 < intermediate_size <= 4096")
 
+    hidden = w2.shape[1]
+    use_fused = has_fused and (
+        hidden % 512 == 0 and hidden <= 8192 and w13.shape[1] % 512 == 0
+    )
+    if use_fused:
+        l1, l2 = deep_gemm.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+            (w13, scales[0].data), (w2, scales[1].data), layout="tiled"
+        )
+        experts.w13_weight.data, scales[0].data, w13_scale_2 = l1
+        experts.w2_weight.data, scales[1].data, w2_scale_2 = l2
+        for scale in scales:
+            scale.format_ue8m0 = False
+        experts.register_parameter(
+            "w13_mega_scale_2", torch.nn.Parameter(w13_scale_2, requires_grad=False)
+        )
+        experts.register_parameter(
+            "w2_mega_scale_2", torch.nn.Parameter(w2_scale_2, requires_grad=False)
+        )
+        experts._mega_moe_sm90_fused_scale_names = scale_names
+        experts._mega_moe_sm90_fused_fp4 = True
+        experts._mega_moe_sm90_fp4_weights = True
+        experts._mega_moe_weights_built = True
+        return
+
+    if not has_legacy:
+        raise ValueError(
+            "DeepGEMM PR #473 requires hidden and 2 * intermediate_size to "
+            "be multiples of 512 and hidden <= 8192"
+        )
+
     fp32_scales = []
     for scale in scales:
         if scale.dtype == torch.uint8:
@@ -269,28 +311,10 @@ def build_sm90_fp4_mega_moe_experts_weights(
                 f"Expected FP32 or raw UE8M0 expert scales, got {scale.dtype}"
             )
 
-    tail_rs = (
-        getattr(experts, "_mega_moe_sm90_fp4_enable_tail_rs", False)
-        and w13.shape == (96, 4608, 2560)
-        and w2.shape == (96, 5120, 1152)
-    )
-    pack_tail_rs = tail_rs and getattr(
-        experts, "_mega_moe_sm90_fp4_pack_tail_rs", False
-    )
-    transform_options = {"pack_for_register_weights": True} if pack_tail_rs else {}
     l1, l2 = deep_gemm.transform_weights_for_mega_moe_sm90_fp4(
         (w13.view(torch.int8), fp32_scales[0]),
         (w2.view(torch.int8), fp32_scales[1]),
-        **transform_options,
     )
-    if pack_tail_rs:
-        experts._mega_moe_sm90_fp4_tail_rs_max_tokens = (
-            deep_gemm.get_sm90_fp4_register_max_tokens()
-        )
-    elif tail_rs:
-        max_tokens = getattr(deep_gemm, "get_sm90_fp4_row_major_rs_max_tokens", None)
-        if max_tokens is not None:
-            experts._mega_moe_sm90_fp4_tail_rs_max_tokens = max_tokens()
     experts.w13_weight.data, scales[0].data = l1
     experts.w2_weight.data, scales[1].data = l2
     for scale in scales:

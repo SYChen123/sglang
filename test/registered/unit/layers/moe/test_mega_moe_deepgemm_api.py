@@ -159,7 +159,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertEqual(mega_moe._MEGA_MOE_SYMM_BUFFER, {})
 
     def test_mxf4_weight_transform_uses_matching_mma_type(self):
-        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+        from sglang.srt.layers.quantization import mxfp4
 
         deep_gemm = ModuleType("deep_gemm")
         deep_gemm.transform_sf_into_required_layout = MagicMock(
@@ -170,7 +170,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         deep_gemm.transform_weights_for_mega_moe = MagicMock(
             side_effect=lambda l1, l2, **_kwargs: (l1, l2)
         )
-        method = object.__new__(Mxfp4MoEMethod)
+        method = object.__new__(mxfp4.Mxfp4MoEMethod)
         method.use_marlin = False
         method.use_deep_gemm = False
         method.use_mega_moe = True
@@ -191,6 +191,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(
+                mxfp4, "get_platform", return_value=SimpleNamespace(is_sm90=False)
+            ),
             patch.object(mega_moe, "_mega_moe_mma_type", return_value="mxf4xmxf4"),
             # Toy shapes.
             patch.object(mega_moe, "check_mega_moe_shapes"),
@@ -255,6 +258,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                         experts, scale_names=names
                     )
                 dg.transform_weights_for_mega_moe_sm90_fp4.assert_called_once()
+                self.assertEqual(
+                    dg.transform_weights_for_mega_moe_sm90_fp4.call_args.kwargs, {}
+                )
                 for param, scale_name, pair in zip(
                     (experts.w13_weight, experts.w2_weight), names, transformed
                 ):
@@ -272,83 +278,121 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     self.assertEqual(pair[1].dtype, torch.float32)
                     self.assertTrue(torch.equal(pair[1], torch.ones_like(pair[1])))
 
-    def test_sm90_fp4_tail_selects_rs_with_paired_weights(self):
+    def test_sm90_fused_fp4_uses_one_packed_layout_and_its_own_workspace(self):
         dg = self.deep_gemm
         dg.mega_moe_pre_dispatch_sm90 = MagicMock()
-        dg.fp8_fp4_mega_moe = MagicMock()
-        dg.get_sm90_fp4_register_max_tokens = MagicMock(return_value=128)
-        shapes = ((96, 4608, 2560), (96, 5120, 1152))
-        weights = [torch.empty(s, dtype=torch.int8, device="meta") for s in shapes]
-        scales = [torch.empty((e, n, k // 16), device="meta") for e, n, k in shapes]
-        transformed = tuple(
-            (
-                torch.empty((e, n, k, 1), dtype=torch.int8, device="meta"),
-                torch.empty((e, n, k // 64), dtype=torch.int32, device="meta"),
-            )
-            for e, n, k in shapes
-        )
-        dg.transform_weights_for_mega_moe_sm90_fp4 = MagicMock(return_value=transformed)
-        experts = SimpleNamespace(
-            _mega_moe_sm90_fp4_enable_tail_rs=True,
-            _mega_moe_sm90_fp4_pack_tail_rs=True,
-            w13_weight=torch.nn.Parameter(weights[0], requires_grad=False),
-            w2_weight=torch.nn.Parameter(weights[1], requires_grad=False),
-            w13_weight_scale_inv=torch.nn.Parameter(scales[0], requires_grad=False),
-            w2_weight_scale_inv=torch.nn.Parameter(scales[1], requires_grad=False),
-        )
+        dg.fp8_mxfp4_mega_moe = MagicMock()
+        dg.transform_weights_for_mega_moe_sm90_fp4 = MagicMock()
+        dg.get_symm_buffer_for_mega_moe = MagicMock(return_value=object())
         buf = SimpleNamespace(x=None, x_sf=None, topk_idx=None, topk_weights=None)
-        with patch.dict(sys.modules, {"deep_gemm": dg}):
-            mega_moe_sm90.build_sm90_fp4_mega_moe_experts_weights(experts)
-            self.assertEqual(
-                dg.transform_weights_for_mega_moe_sm90_fp4.call_args.kwargs,
-                {"pack_for_register_weights": True},
+        dg.get_symm_buffer_for_sm90_fused_mega_moe = MagicMock(return_value=buf)
+
+        experts = torch.nn.Module()
+        experts.num_experts = 8
+        experts._mega_moe_nvfp4 = False
+        experts._mega_moe_w4a4 = False
+        scale_names = ("w13_weight_scale_inv", "w2_weight_scale_inv")
+        transformed = []
+        for name, scale_name, k in zip(
+            ("w13_weight", "w2_weight"), scale_names, (512, 256)
+        ):
+            weight = torch.empty((2, 512, k // 2), dtype=torch.int8, device="meta")
+            scale = torch.empty((2, 512, k // 32), dtype=torch.uint8, device="meta")
+            experts.register_parameter(
+                name, torch.nn.Parameter(weight, requires_grad=False)
             )
-            for param, original in zip(
-                (experts.w13_weight, experts.w2_weight), transformed
-            ):
-                self.assertTrue(torch._C._is_alias_of(param, original[0]))
-            for prefill, rows, cp_rows, expected_rs in (
-                (True, 0, [0] * 4, False),
-                (True, 1, [1] * 4, True),
-                (True, 32, [32] * 4, True),
-                (True, 63, [63] * 4, True),
-                (True, 64, [64] * 4, True),
-                (True, 128, [128] * 4, True),
-                (True, 129, [129] * 4, False),
-                (True, 319, [319] * 4, False),
-                (True, 320, [320] * 4, False),
-                (True, 4096, [4096] * 4, False),
-                (True, 32, [32, 32, 64, 64], False),
-                (True, 32, None, False),
-                (False, 32, [32] * 4, False),
-            ):
-                with self.subTest(prefill=prefill, rows=rows, cp_rows=cp_rows):
-                    batch = SimpleNamespace(
-                        forward_mode=SimpleNamespace(
-                            is_extend_without_speculative=lambda: prefill,
+            experts.register_parameter(
+                scale_name, torch.nn.Parameter(scale, requires_grad=False)
+            )
+            transformed.append(
+                (
+                    torch.empty(
+                        (2, 2, k // 128, 16384), dtype=torch.int8, device="meta"
+                    ),
+                    torch.empty_like(scale),
+                    torch.empty((2,), dtype=torch.float32, device="meta"),
+                )
+            )
+        dg.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90 = MagicMock(
+            return_value=transformed
+        )
+        ranks = [0, 1, 2, 3]
+        group = SimpleNamespace(ranks=ranks, device_group=object())
+        from sglang.srt.environ import envs
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": dg}),
+            patch.object(mega_moe, "_device_sm", 90),
+            patch.object(mega_moe_sm90, "_device_sm", 90),
+            get_parallel().override(moe_ep_group=group, attn_cp_group=group),
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(64),
+        ):
+            for _ in range(2):
+                mega_moe_sm90.build_sm90_fp4_mega_moe_experts_weights(experts)
+            self.assertTrue(mega_moe_sm90.is_sm90_fp4_mega_moe_available(experts))
+            for rows in (0, 32):
+                out = mega_moe.run_mega_routed_experts(
+                    experts,
+                    torch.empty((rows, 512)),
+                    torch.empty((rows, 2), dtype=torch.int64),
+                    torch.empty((rows, 2), dtype=torch.float32),
+                    top_k=2,
+                    num_tokens=rows,
+                    hidden_size=512,
+                    intermediate_size=256,
+                    routed_scaling_factor=2.5,
+                    forward_batch=SimpleNamespace(
+                        attn_cp_metadata=SimpleNamespace(
+                            per_rank_actual_token=[0, 16, 32, 24],
                         ),
-                        attn_cp_metadata=SimpleNamespace(per_rank_actual_token=cp_rows),
-                    )
-                    mega_moe_sm90.run_sm90_mega_routed(
-                        experts,
-                        torch.empty((rows, 16)),
-                        torch.empty((rows, 6), dtype=torch.int32),
-                        torch.empty((rows, 6)),
-                        buf,
-                        rows,
-                        hidden_size=16,
-                        forward_batch=batch,
-                    )
-                    call_args = dg.fp8_fp4_mega_moe.call_args
-                    for actual, original in zip(call_args.args[1:3], transformed):
-                        self.assertEqual(actual[0].ndim, 4)
-                        for tensor, source in zip(actual, original):
-                            self.assertTrue(torch._C._is_alias_of(tensor, source))
-                    self.assertEqual(
-                        call_args.kwargs["use_sm90_packed_ss"], not expected_rs
-                    )
-                    self.assertNotIn("use_sm90_register_weights", call_args.kwargs)
-        dg.transform_weights_for_mega_moe_sm90_fp4.assert_called_once()
+                    ),
+                )
+                self.assertEqual(out.shape, (rows, 512))
+                call = dg.fp8_mxfp4_mega_moe.call_args
+                self.assertIs(call.args[3], buf)
+                self.assertEqual(
+                    call.kwargs, {"activation_clamp": None, "num_tokens_bound": 32}
+                )
+                self.assertEqual(
+                    dg.mega_moe_pre_dispatch_sm90.call_args.kwargs[
+                        "routed_scaling_factor"
+                    ],
+                    2.5,
+                )
+                for triple, repacked in zip(call.args[1:3], transformed):
+                    for param, expected in zip(triple, repacked):
+                        self.assertTrue(torch._C._is_alias_of(param, expected))
+        dg.transform_weights_for_mega_moe_sm90_fp4.assert_not_called()
+        dg.get_symm_buffer_for_mega_moe.assert_not_called()
+        dg.get_symm_buffer_for_sm90_fused_mega_moe.assert_called_once()
+        transform = dg.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90
+        transform.assert_called_once()
+        self.assertEqual(transform.call_args.kwargs, {"layout": "tiled"})
+        self.assertFalse(hasattr(experts, "mega_l1_weights"))
+        self.assertFalse(hasattr(experts, "mega_l2_weights"))
+        params = dict(experts.named_parameters())
+        for name, repacked in zip(("w13_mega_scale_2", "w2_mega_scale_2"), transformed):
+            self.assertTrue(torch._C._is_alias_of(params[name], repacked[2]))
+
+    def test_sm90_fused_fp4_dp_bound_uses_physical_rows(self):
+        group = SimpleNamespace(ranks=[0, 1, 2, 3])
+        parallel = SimpleNamespace(
+            moe_ep_group=group,
+            tp_group=group,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=4,
+            moe_ep_size=4,
+        )
+        batch = SimpleNamespace(
+            attn_cp_metadata=None,
+            global_num_tokens_cpu=[1, 8, 24, 16],
+            global_num_tokens_padded_cpu=[32] * 4,
+        )
+        bound = mega_moe._get_sm90_fused_fp4_peer_bound
+        self.assertEqual(bound(parallel, batch, 32), 32)
+        parallel.tp_group = SimpleNamespace(ranks=[0, 1, 2, 3, 4, 5, 6, 7])
+        self.assertIsNone(bound(parallel, batch, 32))
 
     def test_sm90_fp4_rejects_old_api_and_fp4_activations(self):
         dg = ModuleType("deep_gemm")
@@ -382,8 +426,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             _mega_moe_w4a4=False,
             _mega_moe_weights_built=True,
             _mega_moe_sm90_fp4_weights=True,
-            mega_l1_weights=object(),
-            mega_l2_weights=object(),
+            mega_l1_weights=(torch.empty((1, 1, 1)), None),
+            mega_l2_weights=(torch.empty((1, 1, 1)), None),
         )
         from sglang.srt.environ import envs
 
@@ -422,7 +466,13 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 self.assertTrue(torch.equal(pre.args[0], hidden))
                 self.assertTrue(torch.equal(pre.args[1], ids.to(torch.int32)))
                 self.assertEqual(
-                    dg.fp8_fp4_mega_moe.call_args.kwargs["recipe"], (1, 1, 32)
+                    dg.fp8_fp4_mega_moe.call_args.kwargs,
+                    {
+                        "recipe": (1, 1, 32),
+                        "activation": "swiglu",
+                        "activation_clamp": 10.0,
+                        "fast_math": True,
+                    },
                 )
                 self.assertEqual(
                     dg.fp8_fp4_mega_moe.call_args.args[0].shape[0], max(rows, 1)
