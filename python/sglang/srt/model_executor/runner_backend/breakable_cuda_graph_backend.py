@@ -18,7 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
@@ -94,7 +94,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             )
 
     @contextmanager
-    def capture_session(self, stream: torch.cuda.Stream):
+    def capture_session(self, stream: torch.cuda.Stream, *, eager_prefix: bool = False):
         if self._pool is None:
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
@@ -102,7 +102,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._shared_output_buffer = None
         self.begin_cuda_graph_capture()
         try:
-            with self.replay_session():
+            with nullcontext() if eager_prefix else self.replay_session():
                 yield
         finally:
             try:
@@ -116,7 +116,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         forward_fn: Callable[[], Any],
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
-    ) -> None:
+    ) -> Any:
         warmup_out = None
         for _ in range(2):
             self._device_module.synchronize()
@@ -157,6 +157,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
+        return warmup_out
 
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.

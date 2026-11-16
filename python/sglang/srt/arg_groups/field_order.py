@@ -226,6 +226,7 @@ POSITIONAL_FIELD_ORDER = (
     "cuda_graph_backend_prefill",
     "cuda_graph_max_bs_decode",
     "cuda_graph_max_bs_prefill",
+    "cuda_graph_prefill_tail_max_tokens",
     "cuda_graph_bs_decode",
     "cuda_graph_bs_prefill",
     "cuda_graph_prefill_max_context",

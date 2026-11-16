@@ -1663,13 +1663,17 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ) -> int:
         """Physical rows in the selected tail graph's global buffers."""
+        selected = getattr(forward_batch, "tail_bucket_rows_per_rank", None)
+        if selected is not None:
+            cp_size = get_parallel().attn_cp_size if is_cp_active(forward_batch) else 1
+            rows = selected * cp_size
+            assert 0 < rows <= self._prefill_graph_tail_global_capacity()
+            return rows
         if is_cp_active(forward_batch):
-            capacity = self._prefill_graph_tail_capture_capacity_per_rank(forward_batch)
-            selected = getattr(forward_batch, "tail_bucket_rows_per_rank", None)
-            if selected is None:
-                selected = capacity
-            assert 0 < selected <= capacity
-            return selected * get_parallel().attn_cp_size
+            return (
+                self._prefill_graph_tail_capture_capacity_per_rank(forward_batch)
+                * get_parallel().attn_cp_size
+            )
         return min(
             self._prefill_graph_tail_global_capacity(),
             int(forward_batch.out_cache_loc.shape[0]),
@@ -2058,7 +2062,18 @@ class DeepseekV4AttnBackend(
             )
             forward_batch.global_num_token_non_padded_cpu = global_rows
             non_padded = forward_batch.global_num_token_non_padded
-            if non_padded is not None:
+            if (
+                tail.cp_metadata is None
+                and forward_batch.tail_bucket_rows_per_rank is not None
+            ):
+                if self._bcg_tail_num_token_non_padded is None:
+                    self._bcg_tail_num_token_non_padded = tail.positions.new_empty(
+                        (), dtype=torch.int32
+                    )
+                bound = self._bcg_tail_num_token_non_padded.fill_(global_rows)
+                forward_batch.global_num_token_non_padded = bound
+                forward_batch.num_token_non_padded = bound
+            elif non_padded is not None:
                 if self._bcg_tail_num_token_non_padded is None:
                     self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
                 bound = torch.clamp(
@@ -2749,12 +2764,25 @@ class DeepseekV4AttnBackend(
         self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
-        self.tail_forward_metadata = (
-            self._build_late_layer_tail_metadata(forward_batch)
-            if self.enable_decoder_swa_bounded_replay
+        self.tail_forward_metadata = None
+        if (
+            self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
-            else None
-        )
+        ):
+            if forward_batch.tail_bucket_rows_per_rank is not None:
+                # The encoder stays eager. Only tail metadata needs stable GPU
+                # addresses; it must exist before the encoder publishes candidates.
+                max_seq_len = (
+                    _prefill_graph_max_seq_len() or self.MAX_SEQ_LEN_FOR_CAPTURE
+                )
+                self.tail_forward_metadata = self._prefill_graph_tail_metadata(
+                    forward_batch, max_seq_len
+                )
+                self.tail_forward_metadata.candidate_metadata = None
+            else:
+                self.tail_forward_metadata = self._build_late_layer_tail_metadata(
+                    forward_batch
+                )
 
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(

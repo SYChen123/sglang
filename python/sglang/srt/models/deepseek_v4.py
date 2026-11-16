@@ -4252,13 +4252,33 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
-        for i in range(self.start_layer, self.end_layer):
-            if tail is not None and i == self.late_layer_start:
-                # Decode reaches back at most SWA_WINDOW positions.
+        split = (
+            self.late_layer_start
+            if tail is not None or late_dp_counts is not None
+            else self.end_layer
+        )
+        state = self._run_hc_layers(
+            self.start_layer,
+            split,
+            state,
+            positions,
+            input_ids,
+            input_ids_global,
+            forward_batch,
+            hash_ids,
+            cp_extend,
+            capture_dspark,
+            dspark_aux_hidden_states,
+            tail,
+        )
+        if split == self.end_layer:
+            state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+            return state.residual, state.pre, None
+
+        try:
+            if tail is not None:
                 if tail_in_graph:
-                    # Eager break: re-run at replay so the backend swaps onto the
-                    # live batch's tail metadata; the gathers below are captured
-                    # against the persistent index buffers.
+                    # At replay, switch to the live metadata before the captured gathers.
                     tail_sentinel = bcg_deepseek_v4_enter_late_layer_tail(tail_sentinel)
                     saved_full = attn_backend.prefill_graph_late_layer_saved
                 else:
@@ -4266,8 +4286,7 @@ class DeepseekV4Model(nn.Module):
                 state = state.take_rows(tail.rows)
                 input_ids = tail.rows(input_ids)
                 if cp_extend:
-                    # MoE consumes rank-major IDs, so rebuild them from the
-                    # compact local tail rather than indexing the full gather.
+                    # MoE consumes rank-major IDs rebuilt from the local tail.
                     input_ids_global = (
                         attn_cp_interleave_gather(input_ids[:, None]).squeeze(-1)
                         if get_moe_a2a_backend().is_none()
@@ -4280,15 +4299,77 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
-            if late_dp_counts is not None and i == self.late_layer_start:
+            if late_dp_counts is not None:
                 saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
                 if get_moe_a2a_backend().is_none():
-                    # Full-prefill IDs are not indexed by this rank's tail rows.
                     input_ids_global = (
                         _gather_late_layer_ids(input_ids, late_dp_counts, forward_batch)
                         if self.late_layer_vl_routing
                         else None
                     )
+
+            replay_tail = (
+                get_forward().prefill_tail_replay
+                if getattr(forward_batch, "tail_bucket_rows_per_rank", None) is not None
+                and not tail_in_graph
+                else None
+            )
+            if replay_tail is not None:
+                assert tail is not None and split < self.end_layer
+                # The SM90 encoder's last MoE post returns residual and pre.
+                # Keep their exact values across the boundary.
+                assert (
+                    state.pre is not None
+                    and state.input is None
+                    and state.stats is None
+                )
+                residual, pre, tail_aux = replay_tail(
+                    (state.residual, state.pre, positions, input_ids, input_ids_global),
+                    forward_batch,
+                )
+                dspark_aux_hidden_states.extend(tail_aux)
+                return residual, pre, tail
+
+            state = self._run_hc_layers(
+                split,
+                self.end_layer,
+                state,
+                positions,
+                input_ids,
+                input_ids_global,
+                forward_batch,
+                hash_ids,
+                cp_extend,
+                capture_dspark,
+                dspark_aux_hidden_states,
+            )
+            state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+            return state.residual, state.pre, tail
+        finally:
+            if saved_dp is not None:
+                exit_late_layer_dp(forward_batch, saved_dp)
+            if saved_full is not None:
+                if tail_in_graph:
+                    bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
+                else:
+                    attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+
+    def _run_hc_layers(
+        self,
+        start_layer: int,
+        end_layer: int,
+        state: mhc.HcState,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        hash_ids: Optional[torch.Tensor],
+        cp_extend: bool,
+        capture_dspark: bool,
+        dspark_aux_hidden_states: List[torch.Tensor],
+        tail_for_aux: Optional[LateLayerTail] = None,
+    ) -> mhc.HcState:
+        for i in range(start_layer, end_layer):
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4314,8 +4395,8 @@ class DeepseekV4Model(nn.Module):
             if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
                 aux = state.residual
-                if tail is not None and i < self.late_layer_start:
-                    aux = tail.rows(aux)
+                if tail_for_aux is not None:
+                    aux = tail_for_aux.rows(aux)
                 dspark_aux_hidden_states.append(aux.mean(dim=1))
             ctx = (
                 nullcontext()
@@ -4342,16 +4423,61 @@ class DeepseekV4Model(nn.Module):
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
                 )
+        return state
+
+    def prefill_tail_graph_window(self) -> Optional[int]:
+        # SM90 uses the plain mHC residual/pre hand-off at this boundary.
+        if (
+            not _is_cuda
+            or not get_platform().is_sm90
+            or self.config.model_type != "deepseek_v41"
+            or not self.hc_pre_from_prev_sublayer
+            or self.late_layer_start is None
+            or not self.start_layer < self.late_layer_start < self.end_layer
+            or any(
+                self.layers[i].engram is not None
+                for i in range(self.late_layer_start, self.end_layer)
+            )
+        ):
+            return None
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+        return SWA_WINDOW
+
+    @staticmethod
+    def prefill_tail_graph_rows(
+        extend_lens: List[int], cp_size: int
+    ) -> tuple[int, int]:
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+        from sglang.srt.layers.attention.dsv4.cp_bcg import required_tail_rows_per_rank
+
+        return (
+            sum(min(n, SWA_WINDOW) for n in extend_lens),
+            required_tail_rows_per_rank(
+                extend_lens, window=SWA_WINDOW, cp_size=cp_size
+            ),
+        )
+
+    def forward_prefill_tail_graph(
+        self, tensors: tuple[torch.Tensor, ...], forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        residual, pre, positions, input_ids, input_ids_global = tensors
+        aux = []
+        state = self._run_hc_layers(
+            self.late_layer_start,
+            self.end_layer,
+            mhc.HcState(residual, pre),
+            positions,
+            input_ids,
+            input_ids_global,
+            forward_batch,
+            None,
+            is_cp_active(forward_batch),
+            self.dspark_layers_to_capture is not None,
+            aux,
+        )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
-        if saved_dp is not None:
-            exit_late_layer_dp(forward_batch, saved_dp)
-        if saved_full is not None:
-            if tail_in_graph:
-                tail_sentinel = bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
-            else:
-                attn_backend.exit_late_layer_tail(saved_full, forward_batch)
-            return state.residual, state.pre, tail
-        return state.residual, state.pre, None
+        return state.residual, state.pre, aux
 
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.

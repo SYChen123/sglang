@@ -41,6 +41,7 @@ import copy
 import dataclasses
 import inspect
 import logging
+import math
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -76,6 +77,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
@@ -132,6 +134,7 @@ from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
+    get_forward,
     get_memory,
     get_parallel,
     get_schedule,
@@ -139,6 +142,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
     is_cuda,
     is_npu,
@@ -170,6 +174,48 @@ def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int
     collectives when a dense FFN runs with moe_dense_tp_size=1.
     """
     return sorted({get_cuda_graph_max_batch_size(n) for n in capture_tokens})
+
+
+def prefill_tail_buckets(
+    max_tokens: int, window: int, cp_size: int, align: int
+) -> tuple[int, ...]:
+    """Use finer spacing for small tails and grow by at most 25% thereafter."""
+    window_rows = _ceil_div(window, cp_size)
+    window_step = _ceil_div(window_rows, align) * align
+    short_step = _ceil_div(window_rows, 4 * align) * align
+    limit = max_tokens // (cp_size * align) * align
+    rows = align
+    buckets = []
+    while rows < limit:
+        buckets.append(rows)
+        if rows < short_step:
+            rows = min(2 * rows, short_step)
+        elif rows < 4 * window_step:
+            # Include every whole request window, even if alignment rounds
+            # the quarter-window step up.
+            rows = min(rows + short_step, (rows // window_step + 1) * window_step)
+        else:
+            rows += max(1, rows // (4 * window_step)) * window_step
+    if limit > 0:
+        buckets.append(limit)
+    return tuple(rows * cp_size for rows in buckets)
+
+
+def select_prefill_tail_shape(
+    buckets: Sequence[int], global_rows: int, local_rows: int, cp_size: int, align: int
+) -> Optional[ShapeKey]:
+    if global_rows <= 0 or local_rows <= 0:
+        return None
+    for global_bucket in buckets:
+        local_bucket = global_bucket // cp_size
+        if global_rows > global_bucket or local_rows > local_bucket:
+            continue
+        if global_bucket - global_rows > max(
+            cp_size * (align - 1), global_rows // 4
+        ) or local_bucket - local_rows > max(align - 1, local_rows // 4):
+            return None
+        return ShapeKey(size=global_bucket, tail_bucket_rows_per_rank=local_bucket)
+    return None
 
 
 def _chunked_prefix_variant(num_chunks: int) -> str:
@@ -298,6 +344,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """
 
     _use_draft_input_embeds = False
+    tail_only = False
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
@@ -340,6 +387,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
+        self.tail_only = prefill_config.tail_only
         qwen_bcg = self.prefill_backend_name == Backend.BREAKABLE and is_qwen4_exp(
             model_runner.model_config.hf_config
         )
@@ -357,13 +405,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = prefill_config.bs
-        assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
-        self.capture_num_tokens = get_prefill_num_tokens_to_capture(capture_tokens)
-        assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
+        self.max_bs = model_runner.req_to_token_pool.size
+        if self.tail_only:
+            assert prefill_config.tail_max_tokens is not None
+            self._init_tail_capture(prefill_config.tail_max_tokens)
+        else:
+            assert capture_tokens is not None, (
+                "cuda_graph_config[prefill].bs is not set"
+            )
+            self.capture_num_tokens = get_prefill_num_tokens_to_capture(capture_tokens)
+        assert self.capture_num_tokens, "No eligible prefill CUDA graph token buckets"
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
-        self.max_bs = model_runner.req_to_token_pool.size
         self.max_context_size = prefill_config.max_context_size
         self.max_seq_len = prefill_config.max_seq_len
         self._validate_max_context_capacity(
@@ -695,10 +749,67 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_num_tokens = 0
         self.raw_bs = 0
 
+    def _init_tail_capture(self, max_tokens: int) -> None:
+        model_runner = self.model_runner
+        model = _resolve_transformer_layer_model(model_runner.model)
+        window = getattr(model, "prefill_tail_graph_window", lambda: None)()
+        parallel = get_parallel()
+        moe_backend = get_moe_a2a_backend()
+        self._tail_cp_size = parallel.attn_cp_size
+        if (
+            self.prefill_backend_name != Backend.BREAKABLE
+            or window is None
+            or model_runner.is_draft_worker
+            or self.enable_lora
+            or parallel.pp_size != 1
+            or parallel.attn_dp_size != 1
+            or parallel.attn_dcp_size != 1
+            or parallel.enable_cp_tp_group_sharing
+            or get_schedule().enable_mixed_chunk
+            or get_exec().overlap.enable_two_batch_overlap
+            or not (
+                moe_backend.is_none()
+                or moe_backend.is_deepep()
+                or moe_backend.is_megamoe()
+            )
+            or (
+                self._tail_cp_size > 1
+                and not should_enable_cp_bcg_capture(model_runner.server_args)
+            )
+        ):
+            raise ValueError(
+                "Tail-only prefill BCG requires a model with a capturable bounded "
+                "tail and supported prefill parallelism (TP or interleave CP, PP1, DP1)."
+            )
+        self._tail_window = window
+        self._tail_input_buffers: Optional[tuple[torch.Tensor, ...]] = None
+        self._tail_inputs: Dict[ShapeKey, tuple[torch.Tensor, ...]] = {}
+        global_alignment = get_cuda_graph_batch_size_alignment()
+        self._tail_alignment = math.lcm(global_alignment, self._tail_cp_size) // (
+            self._tail_cp_size
+        )
+        if moe_backend.is_deepep():
+            self._tail_alignment = math.lcm(self._tail_alignment, 8)
+        max_requests = get_schedule().max_running_requests or self.max_bs
+        max_tokens = min(max_tokens, min(max_requests, self.max_bs) * window)
+        self.capture_num_tokens = prefill_tail_buckets(
+            max_tokens, window, self._tail_cp_size, self._tail_alignment
+        )
+        logger.info(
+            "Tail-only prefill BCG global buckets=%s; CP size=%d",
+            self.capture_num_tokens,
+            self._tail_cp_size,
+        )
+
     def _is_mamba_track_enabled(self) -> bool:
         return get_exec().mamba.enable_mamba_extra_buffer and (
             not get_memory().disable_radix_cache
         )
+
+    def cuda_graph_output_capacity_rows(self, output: Any) -> Optional[int]:
+        if self.tail_only:
+            return self.max_num_tokens // self._tail_cp_size
+        return super().cuda_graph_output_capacity_rows(output)
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
@@ -1430,6 +1541,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if self.tail_only:
+            return self._select_tail_shape(forward_batch) is not None
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1498,6 +1611,43 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # logits_processor eagerly on top with live request metadata.
         return True
 
+    def _select_tail_shape(self, forward_batch: ForwardBatch) -> Optional[ShapeKey]:
+        if (
+            forward_batch.forward_mode != ForwardMode.EXTEND
+            or forward_batch.contains_mm_inputs()
+            or forward_batch.input_embeds is not None
+            or forward_batch.replace_embeds is not None
+            or (self.enable_cp_bcg_capture and not is_cp_active(forward_batch))
+        ):
+            return None
+        lengths = forward_batch.extend_seq_lens_cpu
+        if not lengths:
+            return None
+        for limit in (self.max_context_size, self.max_seq_len):
+            if limit is not None and (
+                (context_len := self._batch_max_context_len(forward_batch)) is None
+                or context_len > limit
+            ):
+                return None
+        if (
+            self._backend_can_run_prefill_cuda_graph is not None
+            and not self._backend_can_run_prefill_cuda_graph(forward_batch)
+        ):
+            return None
+        global_rows, local_rows = self.layer_model.prefill_tail_graph_rows(
+            lengths, self._tail_cp_size
+        )
+        key = select_prefill_tail_shape(
+            self.capture_num_tokens,
+            global_rows,
+            local_rows,
+            self._tail_cp_size,
+            self._tail_alignment,
+        )
+        if key is not None and self.backend.can_run(forward_batch, key):
+            return key
+        return None
+
     def _build_capture_spec_info(self, num_tokens: int):
         if self.static_draft_hidden_states is None:
             return None
@@ -1507,7 +1657,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_states=self.static_draft_hidden_states[:num_tokens],
         )
 
-    def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
+    def capture_prepare(
+        self, num_tokens: int, *, max_tokens_per_request: Optional[int] = None
+    ) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
         Default tensor inputs are fresh literals; under a Breakable
@@ -1521,6 +1673,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         context_length = min(
             self.max_context_size or model_context_length, model_context_length
         )
+        if max_tokens_per_request is not None:
+            context_length = min(context_length, max_tokens_per_request)
         if self.dllm_attention is not None and self._is_full_backend:
             query_limit = self.dllm_attention.get_prefill_cuda_graph_max_query_len(
                 num_tokens, self._capture_req_slots
@@ -1692,7 +1846,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     stream=get_or_create_global_graph_capture_stream()
                 ) as graph_capture_context:
                     self.stream = graph_capture_context.stream
-                    with self.backend.capture_session(self.stream):
+                    capture_scope = (
+                        self.backend.capture_session(self.stream, eager_prefix=True)
+                        if self.tail_only
+                        else self.backend.capture_session(self.stream)
+                    )
+                    with capture_scope:
                         self._capture_one_stream()
         finally:
             dp_flags.capturing_prefill_graph = False
@@ -1729,6 +1888,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing prefill shape ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
+            if self.tail_only:
+                self._capture_tail_shape(num_tokens)
+                continue
             self.capture_one_shape(num_tokens)
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
@@ -1736,6 +1898,51 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         num_tokens,
                         prefix_num_chunks=captured_n,
                     )
+
+    @torch.no_grad()
+    def _capture_tail_shape(self, num_tokens: int) -> None:
+        local_rows = num_tokens // self._tail_cp_size
+        shape_key = ShapeKey(size=num_tokens, tail_bucket_rows_per_rank=local_rows)
+        batch, attn_backend = self.capture_prepare(
+            num_tokens, max_tokens_per_request=self._tail_window
+        )
+        batch.tail_bucket_rows_per_rank = local_rows
+        if self.enable_cp_bcg_capture:
+            assert self.prefill_cp_bcg_input is not None
+            self.prefill_cp_bcg_input.prepare(
+                self, batch, static_num_tokens=num_tokens, capture=True
+            )
+        attn_backend.init_forward_metadata(batch)
+
+        def capture_tail(tensors, live_batch):
+            # Capture largest first and reuse these addresses across buckets.
+            if self._tail_input_buffers is None:
+                self._tail_input_buffers = tuple(
+                    torch.empty_like(t, memory_format=torch.contiguous_format)
+                    for t in tensors
+                )
+            inputs = tuple(
+                buf[: src.shape[0]]
+                for buf, src in zip(self._tail_input_buffers, tensors, strict=True)
+            )
+            for dst, src in zip(inputs, tensors, strict=True):
+                dst.copy_(src)
+            self._tail_inputs[shape_key] = inputs
+
+            def run_tail():
+                return self.layer_model.forward_prefill_tail_graph(inputs, live_batch)
+
+            # Warm the encoder once with the same small dummy batch. It seeds
+            # the tail's cross-layer KV and candidates, outside the graph pool.
+            with self.backend.replay_session():
+                # The capture session registers collective buffers on exit.
+                # Complete the dummy forward with the last eager warmup output.
+                return self.backend.capture_one(
+                    shape_key, run_tail, capture_inputs=(inputs, live_batch)
+                )
+
+        with get_forward().scoped(prefill_tail_replay=capture_tail):
+            self._run_forward(batch, num_tokens)
 
     def capture_one_shape(
         self,
@@ -2328,6 +2535,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
+        if self.tail_only:
+            return self._execute_tail_only(forward_batch, **kwargs)
         self._validate_capture_hidden_mode(forward_batch)
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
@@ -2376,3 +2585,30 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     **kwargs,
                 )
             return self._finalize_execute_output(output)
+
+    def _execute_tail_only(self, forward_batch: ForwardBatch, **kwargs):
+        shape_key = self._select_tail_shape(forward_batch)
+        assert shape_key is not None, "Tail replay admitted without a captured bucket"
+        batch = dataclasses.replace(
+            forward_batch, tail_bucket_rows_per_rank=shape_key.tail_bucket_rows_per_rank
+        )
+        inputs = self._tail_inputs[shape_key]
+
+        def replay_tail(tensors, live_batch):
+            for dst, src in zip(inputs, tensors, strict=True):
+                assert dst.shape == src.shape
+                dst.copy_(src)
+            with (
+                self.backend.replay_session(),
+                self._prefill_forward_context(
+                    live_batch,
+                    num_tokens=shape_key.size,
+                    raw_num_tokens=live_batch.global_num_token_non_padded_cpu,
+                ),
+            ):
+                return self.backend.replay(shape_key, live_batch)
+
+        with get_forward().scoped(prefill_tail_replay=replay_tail):
+            return self.model_runner.eager_runner.execute(
+                batch, pp_proxy_tensors=kwargs.get("pp_proxy_tensors")
+            )

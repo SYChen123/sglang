@@ -73,6 +73,10 @@ def parse_cuda_graph_config(server_args: Any):
         _set(Phase.DECODE, "max_bs", cfg.cuda_graph_max_bs_decode)
     if cfg.cuda_graph_max_bs_prefill is not None:
         _set(Phase.PREFILL, "max_bs", cfg.cuda_graph_max_bs_prefill)
+    if cfg.cuda_graph_prefill_tail_only:
+        _set(Phase.PREFILL, "tail_only", True)
+    if cfg.cuda_graph_prefill_tail_max_tokens is not None:
+        _set(Phase.PREFILL, "tail_max_tokens", cfg.cuda_graph_prefill_tail_max_tokens)
     if cfg.cuda_graph_max_seq_len_prefill is not None:
         _set(Phase.PREFILL, "max_seq_len", cfg.cuda_graph_max_seq_len_prefill)
     if cfg.cuda_graph_bs_decode is not None:
@@ -92,6 +96,20 @@ def parse_cuda_graph_config(server_args: Any):
             continue
         for key, value in phase_config.items():
             _set(phase, key, value)
+
+    if type(config.prefill.tail_only) is not bool:
+        raise ValueError("Prefill CUDA graph tail_only must be a boolean")
+    if config.prefill.tail_only:
+        tail_max_tokens = config.prefill.tail_max_tokens
+        if tail_max_tokens is None:
+            tail_max_tokens = 1024
+        if type(tail_max_tokens) is not int or tail_max_tokens <= 0:
+            raise ValueError("Prefill CUDA graph tail_max_tokens must be positive")
+        if config.prefill.backend != Backend.BREAKABLE:
+            raise ValueError("Prefill CUDA graph tail_only requires breakable")
+        config.prefill.tail_max_tokens = tail_max_tokens
+        # Explicit tail capture opts into BCG on models that default to eager.
+        locked.add((Phase.PREFILL, "backend"))
 
     declare_resolution(
         server_args,

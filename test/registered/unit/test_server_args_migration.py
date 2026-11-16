@@ -175,6 +175,26 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             (True, Backend.DISABLED, Backend.DISABLED),
         )
 
+    def test_prefill_tail_capture_requires_opt_in(self):
+        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
+
+        def prefill(argv):
+            sa = self._parse(argv)
+            parse_cuda_graph_config(sa)
+            return resolution_result(sa, "cuda_graph_config").prefill
+
+        cap = ["--cuda-graph-prefill-tail-max-tokens", "512"]
+        self.assertFalse(prefill(["--disable-prefill-cuda-graph", *cap]).tail_only)
+
+        breakable = ["--cuda-graph-backend-prefill", "breakable"]
+        self.assertFalse(prefill([*breakable, *cap]).tail_only)
+
+        enable = [*breakable, "--cuda-graph-prefill-tail-only"]
+        default_tail = prefill(enable)
+        self.assertTrue(default_tail.tail_only)
+        self.assertEqual(default_tail.tail_max_tokens, 1024)
+        self.assertEqual(prefill([*enable, *cap]).tail_max_tokens, 512)
+
     def test_each_deprecation_shape_does_its_job(self):
         """The four `Deprecated*Action` shapes, on a throwaway parser.
 

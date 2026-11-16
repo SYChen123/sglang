@@ -289,6 +289,7 @@ class EagerRunner(BaseRunner):
         # directly from the live ``spec_info`` tensors.
         if (
             forward_batch.needs_forward_metadata_init()
+            or forward_batch.tail_bucket_rows_per_rank is not None
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):

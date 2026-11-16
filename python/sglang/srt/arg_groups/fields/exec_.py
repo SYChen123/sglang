@@ -570,6 +570,15 @@ class ExecGraph(msgspec.Struct):
     cuda_graph_max_bs_prefill: A[
         Optional[int], "Maximum batch size captured for the prefill cuda graph."
     ] = None
+    cuda_graph_prefill_tail_only: A[
+        bool,
+        "Capture only the bounded decoder tail with the breakable prefill backend.",
+    ] = False
+    cuda_graph_prefill_tail_max_tokens: A[
+        Optional[int],
+        "Maximum global token bucket for --cuda-graph-prefill-tail-only (default: 1024). "
+        "Ignored when tail-only capture is disabled.",
+    ] = None
     cuda_graph_max_seq_len_prefill: A[
         Optional[int],
         "Longest sequence a prefill cuda graph replay admits; longer batches "

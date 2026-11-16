@@ -526,12 +526,12 @@ def capture_prefill_graph(
         )
         return result(None)
 
-    # Disable prefill CUDA graph for non capture size
-    if not get_exec().graph.cuda_graph_config.prefill.bs:
+    prefill_config = get_exec().graph.cuda_graph_config.prefill
+    tail_only = prefill_config.tail_only
+    if not prefill_config.bs and not tail_only:
         logger.warning("Disable prefill CUDA graph because the capture size is not set")
         return result(None)
 
-    prefill_config = get_exec().graph.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
     parallel = get_parallel()
     if (
@@ -562,13 +562,14 @@ def capture_prefill_graph(
     max_capture_tokens = max_capture_requests * context_length
     capture_num_tokens = sorted(
         num_tokens
-        for num_tokens in prefill_config.bs
+        for num_tokens in prefill_config.bs or ()
         if num_tokens <= max_capture_tokens
     )
     # Resolve the context- and request-capacity-bounded buckets once before
     # constructing the runner so every backend consumes the same config.
-    prefill_config.bs = capture_num_tokens
-    if not capture_num_tokens:
+    if not tail_only:
+        prefill_config.bs = capture_num_tokens
+    if not capture_num_tokens and not tail_only:
         logger.warning(
             "Disable prefill CUDA graph capture because no configured "
             "capture size fits backend=%s with max_capture_tokens=%s "
@@ -637,10 +638,15 @@ def capture_prefill_graph(
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
-    capture_name = f"{role} prefill"
+    capture_name = f"{role} prefill tail" if tail_only else f"{role} prefill"
+    capture_shape_description = (
+        f"tail_max_tokens={prefill_config.tail_max_tokens}"
+        if tail_only
+        else f"num_tokens={capture_num_tokens}"
+    )
     logger.info(
         f"Capture {capture_name} CUDA graph begin. "
-        f"backend={prefill_backend}, num_tokens={capture_num_tokens}, "
+        f"backend={prefill_backend}, {capture_shape_description}, "
         f"avail mem={before_mem:.2f} GB"
     )
 

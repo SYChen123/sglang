@@ -82,6 +82,8 @@ ALLOWED_KEYS_PER_PHASE = {
         "full_prefill_max_req",
         "full_prefill_prefix_chunk_tokens",
         "max_seq_len",
+        "tail_max_tokens",
+        "tail_only",
     ),
 }
 
@@ -114,6 +116,9 @@ class PhaseConfig:
     # Prefill only: a batch whose longest sequence exceeds this replays eagerly, and
     # backends that capture context-wide work size it. None defers to token buckets.
     max_seq_len: Optional[int] = None
+    # Global token capacity for a separately captured prefill decoder tail.
+    tail_max_tokens: Optional[int] = None
+    tail_only: bool = False
 
 
 def default_prefill_backend() -> str:

@@ -137,6 +137,7 @@ class TestDSV41CPTail(CustomTestCase):
                 for i in range(3)
             ],
         )
+        model._run_hc_layers = DeepseekV4Model._run_hc_layers.__get__(model)
         with (
             patch(f"{MODEL}.is_cp_active", return_value=True),
             patch(f"{MODEL}.get_parallel", return_value=parallel),
@@ -648,6 +649,31 @@ class TestDSV41CPTailGraph(CustomTestCase):
 
 
 class TestDSV41CPTailBuckets(CustomTestCase):
+    def test_tail_only_admits_by_tail_rows_and_rank_ownership(self):
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            prefill_tail_buckets,
+            select_prefill_tail_shape,
+        )
+
+        buckets = prefill_tail_buckets(512, 128, 4, 8)
+        self.assertEqual(buckets[-1], 512)
+        for lengths in ([4096] * 3, [5461, 5461, 5462]):
+            global_rows, local_rows = DeepseekV4Model.prefill_tail_graph_rows(
+                lengths, 4
+            )
+            key = select_prefill_tail_shape(buckets, global_rows, local_rows, 4, 8)
+            self.assertEqual((key.size, key.tail_bucket_rows_per_rank), (384, 96))
+
+        global_rows, local_rows = DeepseekV4Model.prefill_tail_graph_rows(
+            [1, 131, 1], 4
+        )
+        self.assertEqual((global_rows, local_rows), (130, 34))
+        key = select_prefill_tail_shape(buckets, global_rows, local_rows, 4, 8)
+        self.assertEqual((key.size, key.tail_bucket_rows_per_rank), (160, 40))
+        self.assertIsNone(select_prefill_tail_shape((384,), 128, 32, 4, 8))
+        self.assertIsNone(select_prefill_tail_shape(buckets, 513, 128, 4, 8))
+        self.assertIsNone(select_prefill_tail_shape(buckets, 512, 129, 4, 8))
+
     def test_tail_bucket_policy_covers_small_batches_and_bounds_padding(self):
         from sglang.srt.layers.attention.dsv4.cp_bcg import (
             capture_tail_buckets_per_rank,
