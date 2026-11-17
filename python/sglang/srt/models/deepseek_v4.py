@@ -1105,7 +1105,10 @@ class MqaAttentionBase(nn.Module):
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
         from sglang.srt.layers.cp.cp_decode_attn_dp import use_cp_decode_attn_dp
 
-        if isinstance(self, MQALayer) and use_cp_decode_attn_dp(forward_batch):
+        if isinstance(self, MQALayer) and use_cp_decode_attn_dp(
+            forward_batch,
+            is_draft=getattr(get_attn_backend(), "is_draft_runner", False),
+        ):
             yield
             return
         ctx = get_cp_decode_attn_tp_ctx()
@@ -2238,8 +2241,19 @@ class MQALayer(MqaAttentionBase):
                 positions=positions,
                 forward_batch=forward_batch,
             )
-        elif self.compressor is not None or self.indexer is not None:
-            raise NotImplementedError("CP decode DP requires V4.1 low-ratio sources")
+        else:
+            if self.indexer is not None:
+                attn_backend.forward_c4_indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    c4_indexer=self.indexer,
+                    forward_batch=forward_batch,
+                    query_layout=layout,
+                )
+            if self.compressor is not None:
+                attn_backend.forward_core_compressor(
+                    x, forward_batch, self.layer_id, self.compressor
+                )
         assert isinstance(q_for_wqb, torch.Tensor)
         q = self._compute_q_b(layout.select(q_for_wqb), layout.select(positions), q_out)
         return q, None
@@ -2258,7 +2272,11 @@ class MQALayer(MqaAttentionBase):
         attn_backend = get_attn_backend()
         from sglang.srt.layers.cp.cp_decode_attn_dp import cp_decode_query_layout
 
-        decode_dp = cp_decode_query_layout(forward_batch, x.shape[0])
+        decode_dp = cp_decode_query_layout(
+            forward_batch,
+            x.shape[0],
+            is_draft=getattr(attn_backend, "is_draft_runner", False),
+        )
         query_rows = decode_dp.local_rows if decode_dp is not None else x.shape[0]
         if TYPE_CHECKING:
             assert isinstance(
@@ -2389,7 +2407,7 @@ class MQALayer(MqaAttentionBase):
                 if self.is_dsv41:
                     # V4.1 kernels read all padded heads, so the padding must be
                     # zero. The buffer is reused per layer; no consumer may keep it.
-                    want = (x.shape[0], kernel_num_heads, self.head_dim)
+                    want = (query_rows, kernel_num_heads, self.head_dim)
                     meta = getattr(attn_backend, "forward_metadata", None)
                     q_padded = getattr(meta, "q_pad_buffer", None)
                     if (
@@ -2407,9 +2425,9 @@ class MQALayer(MqaAttentionBase):
                     # Uninitialized padded TP heads inject NaN into attention on gfx942
                     # (fnuz), so zero-init there; other archs tolerate new_empty and skip
                     # the per-forward memset.
-                    q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
+                    q_padded = x.new_zeros(query_rows, kernel_num_heads, self.head_dim)
                 else:
-                    q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
+                    q_padded = x.new_empty(query_rows, kernel_num_heads, self.head_dim)
                 tp_slice = slice(0, self.n_local_heads)
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
@@ -2526,7 +2544,11 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if (
+                decode_dp is None
+                and forward_batch.forward_mode.is_extend()
+                and is_in_breakable_cuda_graph()
+            ):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                     # TRT-LLM returns BF16 even with FP8 queries.

@@ -143,6 +143,7 @@ def handle_model_specific_adjustments(server_args: Any):
         NONCAUSAL_FULL_ATTENTION,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
+        is_deepseek_v4,
     )
 
     if cfg.enable_deterministic_inference:
@@ -195,7 +196,8 @@ def handle_model_specific_adjustments(server_args: Any):
             raise ValueError("--cp-decode-attn-mode requires --enable-prefill-cp")
         if cfg.cp_decode_attn_mode == "dp":
             if not (
-                hf_config.model_type == "deepseek_v41"
+                is_deepseek_v4(hf_config)
+                and hf_config.model_type in ("deepseek_v4", "deepseek_v41")
                 and get_platform().is_sm90
                 and cfg.cp_strategy in (None, "interleave")
                 and cfg.tp_size > 1
@@ -205,12 +207,12 @@ def handle_model_specific_adjustments(server_args: Any):
                 and not cfg.enable_kv_cache_sharding
             ):
                 raise ValueError(
-                    "CP decode attention DP requires single-node SM90 DeepSeek-V4.1 "
+                    "CP decode attention DP requires single-node SM90 DeepSeek-V4/V4.1 "
                     "with interleave CP, tp_size>1, dp_size=attn_dp_size=1, "
                     "and replicated KV/index-K caches"
                 )
-        # DP bypasses slicing only for target MQALayer forwards. Keep the
-        # established TP layout for DSpark draft attention.
+        # DP bypasses slicing only for target MQALayer forwards. Draft
+        # attention keeps the existing TP layout.
         declare_resolution(
             server_args,
             "_handle_model_specific_adjustments",

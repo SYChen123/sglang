@@ -989,6 +989,9 @@ class DSV4Metadata:
     q_pad_buffer: Optional[torch.Tensor] = None
     # Full-query and query-DP shapes must never share FlashMLA schedules.
     decode_dp_flashmla_metadata: dict = field(default_factory=dict, repr=False)
+    # C4 scoring shares one rank-local plan across layers. The compressors
+    # continue to consume the original global core and compressor metadata.
+    decode_dp_c4_indexer_metadata: Optional[PagedIndexerMetadata] = None
 
     # What the candidate-source layer published for the index-source layers after
     # it, in the implementation's own type; never copied from the host.
@@ -1010,6 +1013,7 @@ class DSV4Metadata:
 
     def copy_(self, other: DSV4Metadata):
         self.decode_dp_flashmla_metadata.clear()
+        self.decode_dp_c4_indexer_metadata = None
         self.core_attn_metadata.copy_(other.core_attn_metadata)
         maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
         maybe_copy_inplace(self.c1_indexer_metadata, src=other.c1_indexer_metadata)
@@ -1023,6 +1027,7 @@ class DSV4Metadata:
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.decode_dp_flashmla_metadata.clear()
+        self.decode_dp_c4_indexer_metadata = None
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
         )
@@ -3203,6 +3208,7 @@ class DeepseekV4AttnBackend(
             metadata.core_attn_metadata, DSV4AttnMetadata
         ):
             metadata.decode_dp_flashmla_metadata.clear()
+            metadata.decode_dp_c4_indexer_metadata = None
             core = metadata.core_attn_metadata
             core.c0_flashmla_metadata = _create_flashmla_metadata()
             if core.has_c4:
@@ -3281,7 +3287,9 @@ class DeepseekV4AttnBackend(
         if run_indexer and layer.indexer is not None:
             from sglang.srt.layers.cp.cp_decode_attn_dp import cp_decode_query_layout
 
-            layout = cp_decode_query_layout(forward_batch, x.shape[0])
+            layout = cp_decode_query_layout(
+                forward_batch, x.shape[0], is_draft=self.is_draft_runner
+            )
             if layout is None:
                 self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
             elif layout.actual_rows:

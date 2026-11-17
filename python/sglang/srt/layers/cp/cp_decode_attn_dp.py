@@ -10,11 +10,13 @@ import torch.nn.functional as F
 from sglang.srt.runtime_context import get_parallel
 
 
-def use_cp_decode_attn_dp(forward_batch) -> bool:
+def use_cp_decode_attn_dp(forward_batch, *, is_draft: bool = False) -> bool:
     parallel = get_parallel()
     mode = forward_batch.forward_mode
-    return getattr(parallel, "cp_decode_attn_mode", None) == "dp" and (
-        mode.is_decode() or mode.is_target_verify()
+    return (
+        not is_draft
+        and getattr(parallel, "cp_decode_attn_mode", None) == "dp"
+        and (mode.is_decode() or mode.is_target_verify())
     )
 
 
@@ -62,8 +64,8 @@ class CPDecodeQueryLayout:
         return attn_cp_interleave_gather(local)[: self.rows]
 
 
-def cp_decode_query_layout(forward_batch, rows: int):
-    if not use_cp_decode_attn_dp(forward_batch):
+def cp_decode_query_layout(forward_batch, rows: int, *, is_draft: bool = False):
+    if not use_cp_decode_attn_dp(forward_batch, is_draft=is_draft):
         return None
     parallel = get_parallel()
     return CPDecodeQueryLayout(rows, parallel.attn_cp_rank, parallel.attn_cp_size)

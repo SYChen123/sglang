@@ -186,7 +186,7 @@ class Parallel(msgspec.Struct):
         Arg(
             help="Target decode/verify attention layout under prefill CP. 'tp' "
             "enables attention weight slicing; 'dp' shards query rows with full "
-            "heads on SM90 DeepSeek-V4.1. DP keeps KV replicated and DSpark "
+            "heads on SM90 DeepSeek-V4/V4.1. DP keeps KV replicated and "
             "draft attention TP. Omit to preserve --enable-cp-decode-attn-tp.",
             choices=("tp", "dp"),
         ),

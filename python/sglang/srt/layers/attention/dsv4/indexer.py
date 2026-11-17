@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.compressor import (
         CompressorBackendMixin,
     )
+    from sglang.srt.layers.cp.cp_decode_attn_dp import CPDecodeQueryLayout
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -779,6 +781,7 @@ class C4IndexerBackendMixin:
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
+        query_layout: Optional[CPDecodeQueryLayout] = None,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
@@ -807,6 +810,48 @@ class C4IndexerBackendMixin:
             q_lora = q_lora[:num_queries]
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
+
+        indexer_capturer = get_global_indexer_capturer()
+        hisparse_coordinator = self.hisparse_coordinator
+        c4_sparse_page_indices = core_metadata.c4_sparse_page_indices
+        raw_indices = core_metadata.c4_sparse_raw_indices
+        if (
+            query_layout is not None
+            and indexer_capturer is None
+            and hisparse_coordinator is None
+        ):
+            assert not enable_multi_stream
+            if not skip_compressor:
+                # Index-K is replicated; every rank must update every write slot,
+                # including ranks without a query to score.
+                self.forward_indexer_compressor(
+                    x, forward_batch, c4_indexer.layer_id, c4_indexer.compressor
+                )
+                skip_compressor = True
+            owned_rows = slice(query_layout.start, min(query_layout.stop, num_queries))
+            x, q_lora, positions = (
+                x[owned_rows],
+                q_lora[owned_rows],
+                positions[owned_rows],
+            )
+            if x.shape[0] == 0:
+                return
+            local_indexer_metadata = metadata.decode_dp_c4_indexer_metadata
+            if local_indexer_metadata is None:
+                # DeepGEMM and top-k plans encode row indices. Build them for
+                # these lengths rather than slicing or reusing the global plan.
+                local_indexer_metadata = replace(
+                    indexer_metadata,
+                    page_table=indexer_metadata.page_table[owned_rows],
+                    compressed_seq_lens=indexer_metadata.compressed_seq_lens[
+                        owned_rows
+                    ],
+                )
+                metadata.decode_dp_c4_indexer_metadata = local_indexer_metadata
+            indexer_metadata = local_indexer_metadata
+            c4_sparse_page_indices = c4_sparse_page_indices[owned_rows]
+            if raw_indices is not None:
+                raw_indices = raw_indices[owned_rows]
 
         if enable_multi_stream:
             q_indexer, weights = self._forward_prepare_multi_stream(
@@ -889,9 +934,7 @@ class C4IndexerBackendMixin:
         )
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
-        c4_sparse_page_indices = match_num_queries(
-            core_metadata.c4_sparse_page_indices, value=-1
-        )
+        c4_sparse_page_indices = match_num_queries(c4_sparse_page_indices, value=-1)
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
@@ -920,23 +963,19 @@ class C4IndexerBackendMixin:
         if self.debug_use_external_c4_sparse_indices:
             return
 
-        indexer_capturer = get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
 
-        hisparse_coordinator = self.hisparse_coordinator
         hisparse_decode = (
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )
 
-        raw_indices = None
-        if core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
-        elif capture_enabled:
-            raw_indices = torch.empty_like(c4_sparse_page_indices)
-        elif hisparse_decode:
-            raw_indices = hisparse_coordinator.raw_indices_buffer[
-                : c4_sparse_page_indices.size(0)
-            ]
+        if raw_indices is None:
+            if capture_enabled:
+                raw_indices = torch.empty_like(c4_sparse_page_indices)
+            elif hisparse_decode:
+                raw_indices = hisparse_coordinator.raw_indices_buffer[
+                    : c4_sparse_page_indices.size(0)
+                ]
 
         all_rows = slice(0, _c4sl.shape[0])
 
